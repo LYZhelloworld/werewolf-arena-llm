@@ -7,13 +7,34 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Protocol
 
 from engine import rules
 from engine.events import Event, RenderText, Visibility
-from engine.state import Death, DeathCause, GameState, NightState, Phase, Role, Winner
+from engine.state import (
+    Death,
+    DeathCause,
+    GameState,
+    NightState,
+    Phase,
+    Role,
+    Winner,
+    phase_label,
+)
 
 MAX_ADVANCE_STEPS = 64
+
+
+def _counts_text(counts: Mapping[int, int]) -> str:
+    """计票明细 → 「3 号：2 票、5 号：1 票」。空计票说明全员弃权。"""
+    if not counts:
+        return "全部弃权"
+    return "、".join(f"{seat} 号：{count} 票" for seat, count in sorted(counts.items()))
+
+
+def _seats_text(seats: list[int]) -> str:
+    return "、".join(f"{s} 号" for s in seats)
 
 
 class EmitFn(Protocol):
@@ -41,7 +62,7 @@ def advance(state: GameState, emit: EmitFn) -> None:
             "phase_enter",
             Visibility.PUBLIC,
             payload={"phase": state.phase.value, "day": state.day},
-            render=RenderText(text=f"进入阶段：{state.phase.value}"),
+            render=RenderText(text=f"进入阶段：{phase_label(state.phase)}"),
         )
         if state.pending_actors:
             return
@@ -173,6 +194,7 @@ def _resolve_wolf_vote(state: GameState, emit: EmitFn, runoff: bool) -> Phase:
             "vote_result",
             Visibility.WOLF,
             payload={"target": None, "counts": payload_counts, "tied": []},
+            render=RenderText(text=f"狼人没有选出刀口，今夜不刀人（{_counts_text(counts)}）"),
         )
         return Phase.NIGHT_SEER
 
@@ -182,15 +204,30 @@ def _resolve_wolf_vote(state: GameState, emit: EmitFn, runoff: bool) -> Phase:
             "vote_result",
             Visibility.WOLF,
             payload={"target": tops[0], "counts": payload_counts, "tied": []},
+            render=RenderText(
+                text=f"狼人决定刀 {tops[0]} 号（{_counts_text(counts)}）",
+            ),
         )
         return Phase.NIGHT_SEER
 
-    emit("vote_tie", Visibility.WOLF, payload={"tied": tops, "counts": payload_counts})
+    emit(
+        "vote_tie",
+        Visibility.WOLF,
+        payload={"tied": tops, "counts": payload_counts},
+        render=RenderText(
+            text=f"狼人出刀平票：{_seats_text(tops)}（各 {counts[tops[0]]} 票），进入加时协商",
+        ),
+    )
 
     if runoff:
         # 二次平票：确定性兜底，不再追加第三轮
         target = min(tops) if state.board.werewolf.tie_break_by_lowest_seat else None
         state.night.kill_target = target
+        text = (
+            f"狼人两次平票，板子未开座位号兜底，今夜不刀人（{_counts_text(counts)}）"
+            if target is None
+            else f"狼人两次平票，按座位号最小定为 {target} 号（{_counts_text(counts)}）"
+        )
         emit(
             "vote_result",
             Visibility.WOLF,
@@ -200,6 +237,7 @@ def _resolve_wolf_vote(state: GameState, emit: EmitFn, runoff: bool) -> Phase:
                 "tied": tops,
                 "tie_broken": True,
             },
+            render=RenderText(text=text),
         )
         return Phase.NIGHT_SEER
 
@@ -232,10 +270,12 @@ def _resolve_night(state: GameState, emit: EmitFn) -> Phase:
     state.pending_deaths = applied
 
     if night.kill_target is not None:
+        saved_note = "（被女巫救下）" if night.saved else ""
         emit(
             "wolf_kill",
             Visibility.WOLF,
             payload={"seat": night.kill_target, "saved": night.saved},
+            render=RenderText(text=f"狼队刀口：{night.kill_target} 号{saved_note}"),
         )
 
     hunter = rules.seat_of_role(state, Role.HUNTER)
@@ -282,6 +322,7 @@ def _resolve_day_vote(state: GameState, emit: EmitFn, runoff: bool) -> Phase:
             "vote_result",
             Visibility.PUBLIC,
             payload={"target": None, "counts": payload_counts, "tied": []},
+            render=RenderText(text=f"本日无人出局（{_counts_text(counts)}）"),
         )
         return Phase.DAY_RESOLVE
 
@@ -291,10 +332,18 @@ def _resolve_day_vote(state: GameState, emit: EmitFn, runoff: bool) -> Phase:
             "vote_result",
             Visibility.PUBLIC,
             payload={"target": tops[0], "counts": payload_counts, "tied": []},
+            render=RenderText(text=f"{tops[0]} 号被投票出局（{_counts_text(counts)}）"),
         )
         return Phase.DAY_RESOLVE
 
-    emit("vote_tie", Visibility.PUBLIC, payload={"tied": tops, "counts": payload_counts})
+    emit(
+        "vote_tie",
+        Visibility.PUBLIC,
+        payload={"tied": tops, "counts": payload_counts},
+        render=RenderText(
+            text=f"投票平票：{_seats_text(tops)}（各 {counts[tops[0]]} 票），进入加时发言",
+        ),
+    )
 
     if runoff:
         if state.board.vote.no_lynch_on_second_tie:
@@ -311,6 +360,7 @@ def _resolve_day_vote(state: GameState, emit: EmitFn, runoff: bool) -> Phase:
                 "tied": tops,
                 "second_tie": True,
             },
+            render=RenderText(text=f"二次平票，本日无人出局（{_counts_text(counts)}）"),
         )
         return Phase.DAY_RESOLVE
 

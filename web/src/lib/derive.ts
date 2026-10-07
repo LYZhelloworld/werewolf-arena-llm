@@ -13,21 +13,27 @@ export function roleLabel(role: string | null): string {
   return ROLE_LABELS[role] ?? role;
 }
 
-// 阶段英文值 -> 中文标签（覆盖主流阶段；未知阶段退化成原值）。
+// 阶段英文值 -> 中文标签。key 必须与后端 engine/state.py 的 Phase 枚举值逐字一致，
+// 否则阶段分隔条会掉出英文原值（tests/test_ts_types.py 有守卫测试）。
 export const PHASE_LABELS: Record<string, string> = {
-  setup: "准备",
-  night_wolf: "夜间 · 狼人协商",
-  night_seer: "夜间 · 预言家查验",
-  night_witch: "夜间 · 女巫用药",
-  night_hunter_shoot: "夜间 · 猎人开枪",
-  night_resolve: "夜间 · 结算",
+  night_wolf_chat: "夜晚 · 狼人协商",
+  night_wolf_vote: "夜晚 · 狼人出刀",
+  night_wolf_runoff_speech: "夜晚 · 狼人加时协商",
+  night_wolf_runoff_vote: "夜晚 · 狼人重新出刀",
+  night_seer: "夜晚 · 预言家查验",
+  night_witch: "夜晚 · 女巫用药",
+  night_resolve: "夜晚 · 结算",
+  night_hunter_shoot: "夜晚 · 猎人开枪",
   day_announce: "白天 · 死亡公告",
-  day_discuss: "白天 · 自由讨论",
+  day_discussion: "白天 · 自由讨论",
   day_vote: "白天 · 投票",
-  day_resolve: "白天 · 计票",
-  day_last_words: "白天 · 遗言",
-  postgame: "赛后 · 感想",
-  finished: "结束",
+  day_runoff_speech: "白天 · 平票加时发言",
+  day_runoff_vote: "白天 · 平票重投",
+  day_resolve: "白天 · 出局结算",
+  last_words: "遗言",
+  hunter_shoot: "猎人开枪",
+  postgame: "赛后感想",
+  game_over: "对局结束",
 };
 
 export function phaseLabel(phase: string, day: number): string {
@@ -165,4 +171,13 @@ const WINNER_LABELS: Record<string, string> = {
 export function winnerLabel(winner: string | null): string {
   if (!winner) return "未分胜负";
   return WINNER_LABELS[winner] ?? winner;
+}
+
+// 事件正文。**后端保证每个事件都带 render.text**（引擎事件与 agent 侧事件一律如此，
+// 由 tests/test_full_game.py 与 tests/test_agents.py 守卫），前端不再各自解释 payload——
+// 曾经因为这里缺几个分支，界面上直接出现「进入阶段：night_wolf_chat」和赤裸的 {"target":8}。
+// 兜底分支只用于「后端还没更新到这一版」的过渡期，不做业务翻译。
+export function eventText(e: Event): string {
+  if (e.render?.text) return e.render.text;
+  return `[${e.type}] ${JSON.stringify(e.payload)}`;
 }

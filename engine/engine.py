@@ -24,6 +24,7 @@ from engine.state import (
     Player,
     PotionState,
     Role,
+    phase_label,
 )
 
 SPEAKING_TYPES = (ActionType.SPEAK, ActionType.LAST_WORDS, ActionType.REFLECT)
@@ -262,7 +263,7 @@ class RuleEngine:
             "phase_enter",
             Visibility.PUBLIC,
             payload={"phase": state.phase.value, "day": state.day},
-            render=RenderText(text=f"进入阶段：{state.phase.value}"),
+            render=RenderText(text=f"进入阶段：{phase_label(state.phase)}"),
         )
 
     def _consume(self, state: GameState, action: Action, emit: EmitFn) -> None:
@@ -285,19 +286,33 @@ class RuleEngine:
             )
             return
 
-        if kind == ActionType.WOLF_VOTE_KILL:
+        if kind in (ActionType.WOLF_VOTE_KILL, ActionType.VOTE):
             state.votes[actor] = action.target
-            emit("vote_cast", Visibility.SPECTATOR, actor=actor, payload={"target": action.target})
-            return
-
-        if kind == ActionType.VOTE:
-            state.votes[actor] = action.target
-            emit("vote_cast", Visibility.SPECTATOR, actor=actor, payload={"target": action.target})
+            # 狼人出刀与白天投票共用 vote_cast，展示文本按动作类型分叉，
+            # 免得前端把这条赤裸的 {"target": 6} 直接摊给用户看。
+            text = (
+                f"{actor} 号选择刀 {action.target} 号"
+                if kind == ActionType.WOLF_VOTE_KILL
+                else f"{actor} 号投给 {action.target} 号"
+            )
+            emit(
+                "vote_cast",
+                Visibility.SPECTATOR,
+                actor=actor,
+                payload={"target": action.target},
+                render=RenderText(text=text),
+            )
             return
 
         if kind == ActionType.ABSTAIN:
             state.votes[actor] = None
-            emit("vote_abstain", Visibility.SPECTATOR, actor=actor, payload={})
+            emit(
+                "vote_abstain",
+                Visibility.SPECTATOR,
+                actor=actor,
+                payload={},
+                render=RenderText(text=f"{actor} 号弃权"),
+            )
             return
 
         if kind == ActionType.SEER_CHECK:
@@ -349,7 +364,13 @@ class RuleEngine:
             return
 
         if kind == ActionType.WITCH_PASS:
-            emit("witch_pass", Visibility.WITCH, actor=actor, payload={})
+            emit(
+                "witch_pass",
+                Visibility.WITCH,
+                actor=actor,
+                payload={},
+                render=RenderText(text="你今夜不用药"),
+            )
             return
 
         if kind == ActionType.HUNTER_SHOOT:

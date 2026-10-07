@@ -10,6 +10,10 @@ dependencies = [
     "pydantic>=2.9",
     "pyyaml>=6.0",
     "uvicorn>=0.54.0",
+    # uvicorn 不自带 WebSocket 协议实现。缺了它，观战用的 WS 升级请求会被直接打回
+    # 404，日志里只留一句 "No supported WebSocket library detected"——现象和「对局不存在」
+    # 一模一样，极易误诊。装上 websockets（或 wsproto）即可，别去掉。
+    "websockets>=17.2",
 ]
 
 [dependency-groups]

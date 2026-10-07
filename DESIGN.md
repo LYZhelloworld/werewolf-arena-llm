@@ -668,6 +668,14 @@ defaults:
    返回明确原因（如「3 号已出局，请在 1、2、5、7 中选择」）并再次请求。
 4. 轮数超过 `agent.max_tool_turns`（默认 4）仍未产出合法动作 → 走兜底（§8.5）。
 5. **不使用 `tool_choice="required"`**，因为必须先允许模型调用辅助工具。
+6. 模型「只发言、没调任何工具」→ **先把这段发言写进历史**，再追加一条**点名本回合
+   可用工具**的纠正提示，多给一轮。两个约束都有实测依据：
+   - **不能静默丢弃发言**：丢了之后历史会退化成连续多条 `user`（一局实测堆出 8 条），
+     而且模型看不到自己刚说过什么，只会把同一段话原样再说一遍，白烧到轮数用尽。
+   - **纠正提示必须点名工具**：泛泛的「请调用一个工具」对弱模型无效。同理，
+     `prompts.phase_instruction` **每条分支都必须点名本阶段至少一个工具**——
+     只写「说出你的建议」时，9B 模型会老老实实写完一段发言就结束回合（它以为
+     自己已经说过话了），整轮 4 次请求全部白跑（真实教训见 §14 v0.22）。
 
 ### 7.3 记忆工具
 
@@ -819,6 +827,14 @@ user/assistant/tool 消息结构），并把其中值得保留的行累积成一
 # 你是谁
 你是 5 号玩家，身份：预言家。你的目标是让好人阵营获胜。
 
+# 本局板子
+9 人局：3 狼人、1 预言家、1 女巫、1 猎人、3 平民。当前规则下无警长和警徽竞选。
+- 夜晚：狼人先私密协商 2 轮，再由全体狼人投票决定刀口（平票取座位号最小者）；随后预言家查验、女巫用药。
+- 白天有 2 轮自由讨论（单条发言不超过 300 字），然后投票放逐。
+- 投票：所有人同时投票，投票期间看不到别人投给谁；平票则加时辩一轮后重投，再次平票则本日无人出局；允许弃权。
+- 出局：出局只公布座位号，不公布身份，也不公布死因。只有被投票出局的人有遗言。
+- 胜负：屠边——神职全部出局或平民全部出局即狼人获胜，狼人全部出局则好人获胜。
+
 # 当前局面
 第 2 天 · 白天讨论
 存活玩家：1、2、3、5、6、7、8（你是 5 号）
@@ -839,6 +855,14 @@ user/assistant/tool 消息结构），并把其中值得保留的行累积成一
 - 发言不超过 300 字，说人话，像一个真实的玩家，可以撒谎、可以伪装。
 ```
 
+**「本局板子」一节由 `agents/prompts.py::board_brief(board)` 从 `BoardConfig` 渲染**，
+只写引擎**实际兑现**的规则，绝不在 prompt 里写死一套默认规则。除身份分布与全局规则外，
+它还包含两条**恒真声明**：当前规则下无警长和警徽竞选，以及出局不翻牌、不公布死因。
+前者在板子 schema 里没有对应字段（§1.2 非目标），后者 `death.reveal_role` 尚未接线——
+都不能靠读配置得出，但都必须显式告知模型：真实联调中模型正是在无警长的板子上
+自行脑补出了「警上争夺警徽」。板子是**公开信息**（所有席位渲染结果逐字相同），
+不构成信息泄露。
+
 模板放在 **`agents/prompts.py`**（不是 `engine/prompts/`）：
 `engine/` 必须保持零 I/O 的纯净性（§5 原则 3），而 prompt 模板天然属于 LLM 层。
 按角色一份中文模板，运行时注入变量。
@@ -855,6 +879,13 @@ user/assistant/tool 消息结构），并把其中值得保留的行累积成一
   **投票、狼人出刀、赛后感想可以并发**。这是 §2.1 里 wall-clock 估算的前提。
 - 触发限流（HTTP 429）时按 `network_retries` 指数退避重试；
   重试耗尽则走 §8.5 兜底，并写 `fallback: true`。
+- **重试只认真正的传输层失败**（408/409/425/429/5xx，或 SDK 的 `APIConnectionError` /
+  `APITimeoutError` / httpx 系异常）。**不能**写成「没有 HTTP 状态码就重试」——那样会把
+  编程错误当成网络抖动反复重发，把 bug 藏进「重试」这个无害的字眼里（真实教训见 §14 v0.21）。
+- **HTTP 客户端与 event loop 绑定**：编排层每个阶段一次 `asyncio.run`，`httpx` 的连接池
+  属于创建它的那个 loop，跨 loop 复用会抛 `RuntimeError: Event loop is closed`。
+  所以「每阶段一套 SDK 客户端，跑完就在同一个 loop 里关掉」。根治要整局共用一个常驻 loop，
+  但那与本条「不引入常驻后台线程」的取舍冲突，留待 M5 整体 async 化时一并处理。
 
 ---
 
@@ -867,8 +898,8 @@ data/
 └── games/
     ├── index.json                 # 对局索引（列表，按 game_id 覆盖更新）
     └── {game_id}/
-        ├── events.jsonl           # 进行中增量追加（每行一个 JSON 对象，崩溃安全）
-        ├── events.json            # 对局结束时归档的完整 JSON 数组（复盘主用）
+        ├── events.jsonl           # 进行中增量追加（每行一个 JSON 对象，崩溃安全；归档后删除）
+        ├── events.json            # 对局结束时归档的完整 JSON 数组（复盘主用，唯一权威版本）
         ├── meta.json              # 配置快照、模型分配、胜负结果
         └── contexts/              # 可选：每个席位的完整消息历史快照
             └── {seat}.json
@@ -893,6 +924,10 @@ data/
 单个 JSON 数组文件无法安全地增量追加——写入到一半崩溃会留下语法损坏的文件，整局复盘数据全丢。
 因此进行中用 JSON Lines 追加（每行独立，崩溃最多丢最后一行），对局结束时把完整事件数组
 一次性归档为 `events.json`。两者都是 JSON，不引入任何二进制数据库。
+
+`.jsonl` 只是**进行中的临时载体**：`EventLog.archive()` 归档出 `events.json` 之后立即删掉它，
+否则同一份事件会以两种格式长期各留一份。删除顺序固定为「先写 json，再删 jsonl」——
+写 json 失败时 jsonl 仍在，不会两头空。
 
 `index.json` 与 `events.json` 采用**原子写**（写临时文件后 `os.replace`），避免读到半截文件。
 
@@ -930,6 +965,14 @@ data/
   }
 }
 ```
+
+**`render.text` 是每个事件的必备字段，不是可选装饰。** 前端与未来的回放 UI 只认它，
+不再各自解释 `payload`；缺了它就只能把裸 JSON 摊给用户看（真实发生过：界面上出现
+「进入阶段：night_wolf_chat」和赤裸的 `{"target":8}`）。因此 `payload` 里的每一个字段
+（`phase` / `target` / `counts` / `tied` / `seat` / `saved` …）都要在 `text` 里有对应的
+自然语言表达，且**由产生事件的那一层负责生成**（引擎事件在 `engine/`，agent 侧事件在
+`agents/`），不要把翻译责任推给渲染层。`tests/test_full_game.py` 跑 60 局断言「没有任何
+事件缺 `render.text`」，新增事件类型若忘了写文案会立刻红。
 
 ### 8.3 Event Type 枚举（英文）
 
@@ -1179,3 +1222,11 @@ werewolf-arena-llm/
 | 2026-10-07 | v0.12 | M8 上下文压缩落地（`context.max_public_events` 滑动窗口，§7.5）：<br>1. **`agents/context.py` 实现滑动窗口压缩**：累计渲染的公开事件超过 `max_public_events` 时，从**最早回合**开始丢弃该回合 user 消息里的「自上次行动以来：…」事件文本（只丢事件文本、保留局面与指令，不破坏 user/assistant/tool 消息结构）。<br>2. **模板摘要**：被丢弃的行里值得保留的（`DIGEST_TYPES` = 死亡公告 / 投票结果 / 身份揭晓 / 每轮首句）累积成一行「（前情提要：…）」插在 system 之后，最多 `DIGEST_MAX_LINES = 20` 行；纯模板生成，不额外调 LLM。<br>3. **原地压缩**：直接改写 `messages`，故 `contexts/{seat}.json` 快照即「模型实际看到的内容」；`max_public_events <= 0` 视为不压缩。<br>4. **接线**：`LLMPolicy._ensure_contexts` 把 `game.context.max_public_events` 传给 `make_context` → `AgentContext`。<br>5. **测试**：`tests/test_agents.py` 新增 3 例（超窗丢弃最早事件且死亡/首句进摘要、任意回合数下保留行数不超过窗口、非正值时禁用）。全量 **110 passed**，ruff / format / mypy 全绿。 |
 | 2026-10-07 | v0.13 | M8 异常提示落地（后端补信号 + 前端四处提示）：<br>1. **补齐后端信号**（此前只落字符串、未成事件）：`agents/loop.py` 在非法动作时发 `action_rejected`（§8.3 早有此类型，此前从未真正发出），在 CoT 回传被拒剥离重试时发 `llm_downgrade`；两者均 spectator，随 `pending_events` 走正常编号落盘。<br>2. **网络重试改为自管**：`agents/client.py` 不再用 SDK 的 `max_retries`（置 0），自己重试并把次数记进 `LLMResponse.network_retries`——可重试状态为连接类错误（无 status）+ 408/409/425/429/5xx，指数退避上限 4s，4xx 不重试；经 `TurnOutcome.network_retries` 写进 `LlmMeta.network_retries`（§7.7）。<br>3. **事件类型**：§8.3 增加 `llm_downgrade`。<br>4. **前端异常提示**（`web/`）：① 顶部 `NoticeBanner` 置顶显示连接错误与「重连中」（`ConnStatus` 新增 `reconnecting`，断线时置位）；② 事件流对 `action_fallback` / `action_rejected` / `llm_downgrade` / `game_aborted` 加特殊底色与徽标；③ 座位卡标出出现过兜底/非法动作的席位；④ 侧栏统计扩展为 6 项（调用 / token / 兜底 / 非法动作 / CoT 降级 / 网络重试），事件行补「重试N」。<br>5. **测试**：`tests/test_agents.py` 新增 4 例（降级事件、重试计数、400 不重试、`LlmMeta.network_retries` 透传），并更新兜底用例断言（现含 4 条 `action_rejected`）。全量 **114 passed**，ruff / format / mypy 全绿；前端 `tsc --noEmit` + `vite build` 通过（42 模块，~76KB gzip）。 |
 | 2026-10-07 | v0.14 | 前端 TS 类型改为**自动生成**（此前手写对齐，§10.4）：<br>1. **补齐 API 契约模型**（`server/schemas.py`）：新增 `GameListItem` / `GameMeta`（列表项与 `meta.json`）、`WsDone` / `WsError` / `WsMessage`（`RootModel[Event \| WsDone \| WsError]` 联合）。`ws.py` 的 `list_games` / `meta_for` 改为构造这些模型，`app.py` 的 `/games`、`/games/{id}` 加 `response_model` —— 契约在运行期被真正校验，不再是「只写在文档里的形状」；行内 `import json` 提到模块顶部。<br>2. **新增 `scripts/gen_ts_types.py`**：收集 `engine/events.py`（`Event` / `Visibility` / `Thinking` / `LlmMeta` / `RenderText`）与 `server/schemas.py` 的模型 → `model_json_schema(ref_template="#/$defs/{model}")` → 合并 `$defs` → 转成 `web/src/api/types.ts`。自研转换器只覆盖用到的 schema 子集（object / enum / const / anyOf / array / `$ref` / additionalProperties），零额外依赖；写入用显式 `newline="\n"`，读取做 CRLF 归一化（本机 `core.autocrlf=true` 会把工作区写成 CRLF）。<br>3. **防漂移**：`--check` 只校验不写盘；`tests/test_ts_types.py` 4 例（逐字一致 / `--check` 返回 0 / 关键类型齐全 / 无 `$ref`·`$defs` 漏出）。前端侧加 `npm run gen:types` 与 `npm run check:types`。<br>4. **`engine/events.py`**：三处行内注释（`Thinking.source`、`Event.type`、`Event.actor`）改为 `Field(description=...)`，让说明随 schema 带进生成的 TS（注释不再只存在于 Python 源码里）。<br>5. **`web/src/api/types.ts` 变为生成物**，首行带「请勿手改」横幅；字段形状与原手写版一致（响应/事件字段全部非可选——后端 `model_dump` 总会带上默认值；仅 `CreateGameRequest` 按 `required` 加 `?`），前端代码无需改动即编译通过。<br>6. **质量门**：全量 **118 passed**（+4），ruff / format / mypy 全绿；前端 `tsc --noEmit` + `vite build` 通过（42 模块，75.75KB gzip）。 |
+| 2026-10-07 | v0.15 | 首次真实 LLM 联调（本机 LM Studio `qwen/qwen3.5-9b`）后修的观战可读性问题：<br>1. **终端渲染器补齐 agent 侧事件处理器**（`orchestrator/render.py`）：`memory_write` / `memory_read` / `action_fallback` / `action_rejected` / `llm_downgrade` 此前没有 `_on_*`，落入兜底分支 `[{type}] {payload}`，导致**席位信息丢失**（观众看不出记忆是谁写的）。现在统一走 `_seat()` + `_channel()`，例如「（仅本人可见） 1 号 记下「首刀目标」：…」。事件里 `actor` 本来就带着（`agents/loop.py` 构造 `PendingEvent` 时已填 `context.seat`），缺的只是渲染。<br>2. **上帝视角打印内心活动**：`render()` 在打印动作行之前先打印该事件的 `thinking`（`〔内心〕N 号（source）：…`）。**不需要额外视角判断**——玩家视角的 `thinking` 在 `filter_events_for` / `ViewFilter` 里已被物理剔除（恒为 `None`），所以「有就打印」天然只对观众可见。新增 `--no-cot`（不看）与 `--cot-chars`（单条上限，默认 600 字，`0` = 全文）——本地小模型的 CoT 常达数千字且大量重复，不截断会把终端刷爆。<br>3. **修正前端阶段标签错配**（`web/src/lib/derive.ts`）：`PHASE_LABELS` 的 key 与后端 `engine/state.py` 的 `Phase` 枚举大面积不符（`night_wolf`→实为 `night_wolf_chat`/`night_wolf_vote`、`day_discuss`→`day_discussion`、`day_last_words`→`last_words`、`finished`→`game_over`），导致阶段分隔条掉出英文原值；已按后端枚举逐字对齐并补齐 runoff / `hunter_shoot` 等缺失项。新增 `eventText()`，让记忆 / 兜底 / 降级事件在网页也显示可读文本（与终端同一套口径）。<br>4. **守卫测试**：`tests/test_ts_types.py` 新增「`PHASE_LABELS` 必须覆盖全部 `Phase` 值」（解析 `derive.ts` 逐 key 比对，`hunter_shoot` 这类后缀要用行首精确匹配，否则会被 `night_hunter_shoot` 误判为已覆盖）；`tests/test_orchestrator.py` 新增 5 例（记忆事件带席位、异常事件带席位与原因、内心活动展示与排序、`--no-cot` 关闭、超长 CoT 截断与 `cot_chars=0` 不截断）。全量 **124 passed**，ruff / format / mypy 全绿；前端 `tsc --noEmit` + `vite build` 通过（42 模块，75.99KB gzip）。<br>5. **本地模型测试配置**：新增 `configs/models.yaml`（已被 gitignore，不入库）指向 `http://localhost:1234/v1` 的 `qwen/qwen3.5-9b`；单 provider、明文占位 key、`max_concurrency: 1`、`thinking.field: reasoning_content`（实测）、`replay: false`（省 token 且避开入参兼容问题）、`timeout_s: 300`。 |
+| 2026-10-07 | v0.16 | 真实对局复盘后修的两处问题（另收紧一处隐患）：<br>1. **板子配置写进 system prompt**（§7.6）：新增 `agents/prompts.py::board_brief(board)`，把身份分布、夜间/白天流程、投票与平票细则、遗言规则、胜负条件从 `BoardConfig` 渲染成「# 本局板子」一节，插在「# 你是谁」之后；同时把原本写死的「一共 9 名玩家」改为按 `board_total(board)` 计算。**真正要解决的是模型幻觉**：日志里 8 号预言家在无警长的板子上自己脑补出「警上发警徽」，根因不是「没声明无警长」，而是「从没告诉过它本局的板子长什么样」——只堵一条（无警长）下次还会冒出别的（自爆、翻牌、警徽流）。故一并显式声明**当前规则下无警长和警徽竞选**，以及**出局不翻牌、不公布死因**：前者在板子 schema 里根本没有字段（§1.2 非目标），后者 `death.reveal_role` 尚未接线，都读不出配置，但都必须告知模型。板子是公开信息，所有席位渲染结果逐字相同。<br>2. **归档后删除 `events.jsonl`**（§8.1）：`EventLog.archive()` 写完 `events.json` 立即 `unlink` jsonl，不再长期保留两份等价数据（实测 203KB + 184KB）。顺序固定「先写 json，再删 jsonl」——写 json 失败时 jsonl 仍在。<br>3. **测试**：`tests/test_agents.py` 新增 3 例（prompt 含板子、板子改了 prompt 跟着改、板子一节对所有席位逐字相同以杜绝夹带私货）；`tests/test_storage.py` 新增 1 例（无 jsonl 时也能归档 / 可重复归档）、`test_append_then_archive_keeps_every_event` 补断言 jsonl 已删；`tests/test_orchestrator.py::test_cli_writes_archive` 断言由「jsonl 存在」改为「jsonl 不存在」。全量 **128 passed**（+4），ruff / format / mypy 全绿。 |
+| 2026-10-07 | v0.17 | 复盘时发现的三处**配置未接线**（记录在案，暂不改行为）：`death.last_words_on_night_death` / `death.last_words_on_first_night` / `death.reveal_role` 三个字段在 `configs/board.example.yaml` 与 schema 里都存在，但**引擎从未读取**——当前行为恒为「夜间死者无遗言、出局不翻牌」。为此 `board_brief` 只写引擎实际兑现的规则（写死「只有被投票出局的人有遗言」「不公布身份与死因」），避免 prompt 承诺了引擎做不到的事。后续要么接线、要么从 schema 里删掉，二者必居其一。 |
+| 2026-10-07 | v0.18 | 后端根路径加指路牌（`GET /`）：只启动后端、用浏览器打开 `http://127.0.0.1:8000` 会看到裸的 `{"detail":"Not Found"}`——后端只提供 API，界面在前端 5173，这个 404 极易被误读成「服务没起来」。现在根路径返回一张中文 HTML 指路牌（指向 `npm run dev` / 5173、`/docs`、`/games`、`/openapi.json`），`include_in_schema=False` 不污染 OpenAPI；`server.app.main()` 启动时也先打一行「观战界面在前端，请另开终端 cd web && npm run dev」。测试：`tests/test_server.py` 新增 1 例（200 + `text/html` + 含 5173 与 /docs + 不出现在 openapi paths）。全量 **129 passed**（+1）；README 快速开始改为显式的「开两个终端」并说明 8000 只是 API。 |
+| 2026-10-07 | v0.19 | 修「读取历史对战」失败的两个叠加原因（一个装不上、一个逻辑缺）：<br>1. **缺 WebSocket 协议实现**：`uvicorn` 不带 WS 实现，观战用的 WS 升级请求被直接打回 `404 Not Found`，日志只留 `Unsupported upgrade request` / `No supported WebSocket library detected`——现象与「对局不存在」一模一样，极易误诊。依赖里补 `websockets>=17.2`（pyproject 内加注释说明「别去掉」）。注意 `TestClient` 走的是 asgi 内部调用、不经过真实 WS 握手，所以 129 个单测全绿也照样漏掉这个坑——只能靠真实 uvicorn 才能发现。<br>2. **归档对局无法回放**：`GameHandle` 只存在于**本进程**开过的对局，服务一重启，`data/games/*` 里的历史对局就没有句柄，`game_ws` 直接回一句 `找不到对局`——而 `/games` 列表里明明列着它。现在 `game_ws` 在无句柄时改走 `events_for()` 读归档、按 `seat` 过滤后一次性放完再发 `done`，对前端而言与「一场已结束的直播」同构，不必为此单开 REST 通道。配套新增 `GameManager.total_seats()`（内存句柄按板子算、归档按发牌事件算）用于**建立连接前**拦掉越界座位号；抽出 `_role_for_seat()` 供 `seat_role` / `events_for` 共用，顺带修掉座位越界时 `next(...)` 抛 `StopIteration` 的老毛病（取不到即退化为平民视角——只少给信息，绝不漏私有频道）。<br>3. **验证**：单测 +3（重启后归档回放且与 REST 同源同量、归档回放按视角过滤、未知对局报 error），全量 **132 passed**；另用真实 uvicorn + 真实 `websockets` 客户端对归档对局 `20261007-123836-e50545` 跑通端到端（上帝视角 97 事件 + `done`；`?seat=5` 55 事件、无 `role_assigned`），这正是单测覆盖不到的那条路径。 |
+| 2026-10-07 | v0.20 | 修「网页大厅选『指定模型』就启动失败」——两个原因叠在一起，且**错误信息根本到不了前端**：<br>1. **`build_policy` 依赖 `argparse.Namespace`**：CLI 与服务层共用它，服务层构造 `Namespace(random=…, model=…, seed=…)` 时少传了 `config_dir`，而 `--model` 分支要 `load_models(args.config_dir)` → `AttributeError` → **500**。（mock / random 分支走不到那一行，所以此前 6 个服务层测试全绿也没暴露。）<br>2. **模型名不存在时抛 `KeyError`**：`specs_from_models` 用裸 `KeyError` 表示「models.yaml 里没有这个模型」，同样冒成 500。用户只要抄错一次名字（最常见是漏掉 `qwen/qwen3.5-9b` 的 `qwen/` 前缀）就会撞上。<br>3. **为什么用户只看到一句 `Failed to fetch`**：未捕获异常由 `ServerErrorMiddleware` 在 **CORS 中间件外层**生成 500 响应，该响应**不带 `Access-Control-Allow-Origin`**，浏览器据此直接判定为网络层失败，响应体根本到不了前端——于是「500 + 原因」在界面上退化成「连不上」。**设计约束：所有可预期的失败都必须走 `HTTPException`**（在 CORS 内层被 `ExceptionMiddleware` 处理，响应带 CORS 头），绝不让异常裸奔。<br>4. **修复**：`build_policy` 改为**显式关键字参数**（`game, total_seats, *, model, random, seed, config_dir`），取消 Namespace 鸭子类型——少传/写错字段从此是 mypy 报错而非运行时 500；`specs_from_models` 找不到模型改抛 `ConfigError` 并**列出可用模型**；CLI 的 `load_models` / `build_policy` 两处也补 `except ConfigError`（中文提示 + 退出码 1，不再甩 traceback）；前端 `client.ts::jsonOrThrow` 解析 `{"detail": …}`，提示不再带花括号与引号。<br>5. **测试**：`tests/test_server.py` +3（指定模型能起局、缺 models.yaml → 400、模型名写错 → 400 且列出可用值），`tests/test_agents.py` 的 `KeyError` 断言改为 `ConfigError` 并断言含可用模型清单，全量 **135 passed**。另在**真实 uvicorn**（`TestClient` 不走真实 CORS，覆盖不到本问题）下验证：错模型名 → `400` + `access-control-allow-origin: *` + 中文可用模型列表。 |
+| 2026-10-07 | v0.21 | 第二次真实对局（`20261007-133149-af3f3c`）复盘后的两项修复：观战文案，以及**25 次假「网络重试」**。<br>1. **每个事件都必须带 `render.text`**（§8.2 新增约定）：此前只有部分引擎事件有展示文本，其余落到前端的 `JSON.stringify(payload)` 兜底——界面上真实出现「进入阶段：night_wolf_chat」与赤裸的 `{"target":8}`。现在补齐全链路：`phase_enter` 用新增的 `engine.state.PHASE_LABELS` 渲染；`vote_cast`（按动作类型分「N 号选择刀 X 号」/「N 号投给 X 号」）、`vote_abstain`、`vote_result`（日夜双方 × 单人出局 / 无人出局 / 二次平票 / 座位号兜底）、`vote_tie`、`wolf_kill`、`witch_pass` 全部补齐；**agent 侧事件**（`memory_write` / `memory_read` / `action_rejected` / `llm_downgrade` / `action_fallback`）也给 `PendingEvent` 加了 `render` 字段并逐条写文案。前端 `eventText()` 由此从「按 type switch 十几个分支」退化为「取 `render.text`，取不到才兜底」——**翻译责任回到产生事件的那一层**，前端不再各自解释 payload。<br>2. **阶段文案收口为一份**：新增 `engine.state.PHASE_LABELS` + `phase_label()` 作为 UI 文案唯一事实来源；终端渲染器改为 import（删掉本地副本）；`agents/prompts.py` 里同名的表**改名** `PROMPT_PHASE_LABELS` 并注明它面向模型、措辞故意不同（"狼人决定袭击目标" vs "夜晚 · 狼人出刀"）；前端那张表仍在 TS（没法 import Python），守卫测试从「只比 key」升级为 **key 与 value 逐字比对**。<br>3. **修 25 次假重试**（真 bug）：`asyncio.run` 每个阶段换一个 event loop，而 httpx 的连接池绑定在创建它的 loop 上，跨 loop 复用抛 `RuntimeError: Event loop is closed`（`status_code` 为 None）。旧判定是「没状态码就重试」，于是**每个阶段的第一条请求必定假重试一次**——96 次调用报出 25 次重试，正好等于阶段数 26 减一，且每次都是该阶段第一个出场的席位。观战界面把它标成橙色「重试」，看起来像网络差，实为连接池用错了 loop。三层修：① `OpenAICompatClient._sdk()` 按 loop 缓存 SDK 客户端，换 loop 换一套；② `LLMPolicy._decide_batch` 在 `finally` 里 `aclose()` 掉本阶段客户端（留着不关，GC 时会往已关闭的 loop 上安排关闭动作，控制台每次刷一段 `Event loop is closed` 噪音）；③ **重试判定收紧**为「有状态码看 `RETRYABLE_STATUS`；无状态码只认 `APIConnectionError` / `APITimeoutError` / httpx·httpcore·ssl 系异常」，其余立刻抛出——编程错误不能再被重试掩盖（§7.7）。<br>4. **兜底结论（不是设计问题）**：本局 3 次兜底（3/96≈3%）全是「模型未在限定轮数内给出合法动作」，而 `action_rejected` 为 **0**——模型根本没调动作工具（只在正文里说话），不是参数写错，属模型能力问题。顺带确认 `prompt_tokens` 是多轮**累加**值（4 轮 ≈ 7000×4 ≈ 31.5k），不是上下文膨胀。<br>5. **测试与验证**：`test_full_game.py` 新增「60 局内没有任何事件缺 `render.text`」（新增事件类型忘写文案会立刻红）；`test_agents.py` +4（记忆 / 异常事件带 render、编程错误不重试、跨 loop 重建客户端、同 loop 内复用）；`test_ts_types.py` 阶段标签守卫升级。全量 **138 passed**（+3），ruff / format / mypy / TS 类型同步全绿；前端 `vite build` 42 模块 75.86KB gzip。另用**本地假 OpenAI 服务端**做端到端验证：26 个阶段 78 次请求全部一次成功、总重试 0、无 stderr 噪音。 |
+| 2026-10-07 | v0.22 | 接着复盘同一局（`20261007-133149-af3f3c`），发现「兜底」里**有一半确实是设计问题**：<br>1. **根因一：阶段指令没点名工具**（`prompts.phase_instruction`）——全表只有「夜间·狼人协商」写了「说出你的建议」而不给工具名（「白天·加时发言」同样），而该阶段的动作工具 `speak` 在 §7.2 的表里本来就是明写的。9B 模型于是老老实实写完一段发言就结束回合（它以为自己已经说过话了）。**本局 3 次兜底中的 1 次（`night_wolf_chat` 席位 5）正落在这一条上**。修复：两条分支都点名 `speak`，并在 docstring 里把「每条分支都要点名工具」写成约束。<br>2. **根因二：只说话的回复被静默丢弃**（`agents/loop.py`）——原分支直接 `context.messages.append({"role":"user", "content":"你必须通过调用工具来行动，请调用一个工具。"})` 然后 `continue`，**没有把模型这次发言写进历史**。后果有两个：① 历史退化成**连续多条 `user`**，本局实测 `5.json` 堆出 8 条连续 user、`1.json` 6 条，那句提示在 `5.json` 里出现 **9 次**；② 模型看不到自己刚说过什么，只能把同一段话原样再说一遍，4 轮全白烧。修复：先 `_record_spoken_reply()` 把发言写进历史（正文为空时不写，否则是服务端会拒收的空 assistant 消息），再 `_ask_for_tool()` 追加**点名本回合可用工具**的纠正提示（如「…本回合可选：speak、memory_write、memory_read。」），且同一条提示不重复堆叠。<br>3. **剩余的兜底才是模型能力问题**：本局另 2 次（`day_discussion` 席位 1 与 5，同一批次 1 ms 内触发）该阶段的指令本来就点了名，属 9B 模型自身不稳定；`action_rejected` 仍为 **0**，即从未出现「调了工具但参数非法」。<br>4. **测试**：`tests/test_agents.py` +3 —— `test_speaking_phases_instruction_names_the_tool`（四个说话类阶段都必须点名 `speak`）、`test_spoken_reply_is_kept_before_the_tool_reminder`（历史里不得出现连续两条 `user`，且每条纠正提示都排在自己那段发言之后）、`test_empty_replies_do_not_stack_the_same_reminder`（空回复时同一句提示只留一条）。全量 **141 passed**（+3），ruff / format / mypy / TS 类型同步全绿。 |

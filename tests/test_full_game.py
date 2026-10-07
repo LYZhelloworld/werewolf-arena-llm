@@ -40,6 +40,12 @@ def test_many_games_terminate_with_a_winner() -> None:
         # 事件序号连续递增
         assert [e.seq for e in events] == list(range(1, len(events) + 1))
 
+        # 每个事件都必须带展示文本。前端只认 ``render.text``，缺了它就只剩
+        # ``JSON.stringify(payload)`` 一条路——线上真实出现过「进入阶段：night_wolf_chat」
+        # 和赤裸的 ``{"target":8}`` 被直接摊给用户看。这里跑 60 局，覆盖全部事件类型。
+        missing = sorted({e.type for e in events if e.render is None or not e.render.text})
+        assert not missing, f"seed={seed} 以下事件缺 render.text：{missing}"
+
         # 死亡人数与存活人数对得上
         dead = [p for p in state.players.values() if not p.alive]
         assert len(dead) == 9 - len([p for p in state.players.values() if p.alive]), (

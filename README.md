@@ -87,14 +87,28 @@ uv run python -m orchestrator.cli                    # 上帝视角看一局彩�
 uv run python -m orchestrator.cli --view 3           # 换成 3 号玩家的视角（看不到底牌与私有频道）
 uv run python -m orchestrator.cli --games 50 --summary   # 批量压规则，只看结果
 uv run python -m orchestrator.cli --delay 0.3        # 放慢节奏，一屏一屏地看
+uv run python -m orchestrator.cli --no-cot           # 上帝视角但不打印各席位内心活动
+uv run python -m orchestrator.cli --cot-chars 0      # 内心活动不截断（默认每条约 600 字）
 ```
 
-服务化与前端（均已实现）：
+观战时上帝视角会打印每个席位的**内心活动（CoT）**，排在它的动作之前；换成
+`--view N` 玩家视角后自然看不到（该视角的 `thinking` 在过滤阶段已被物理剔除）。
+
+服务化与前端（均已实现）。**开两个终端**：
 
 ```bash
-uv run python -m server.app          # 启动服务，默认 127.0.0.1:8000
-cd web && npm install && npm run dev # 打开前端
+uv run python -m server.app           # 终端 1：后端 API，默认 127.0.0.1:8000
+cd web && npm run dev                 # 终端 2：前端界面，默认 http://localhost:5173
 ```
+
+依赖变了（例如 `pyproject.toml` 更新）时 `uv run` 会自动同步；也可显式 `uv sync`。
+改动依赖后**必须重启后端**才会生效。
+
+观战界面在**前端**的 <http://localhost:5173>，不是后端的 8000——8000 只提供 API，
+直接打开会看到指路牌（`GET /`）而不是界面；API 文档在 <http://127.0.0.1:8000/docs>。
+
+大厅里的**历史对局**（服务重启后仍可看）走的是同一条 WebSocket：后端发现该局不在内存中，
+就把落盘的归档事件按视角过滤后一次性放完。
 
 前端 TS 类型是**生成物**，由后端 Pydantic 模型产出，不要手写；改了后端模型要重新生成：
 
@@ -108,8 +122,8 @@ uv run pytest                           # 会校验 types.ts 是否与后端同�
 每局保存在 `data/games/{game_id}/` 下，全部是 JSON：
 
 ```
-events.jsonl    进行中增量追加（崩溃安全）
-events.json     结束时归档的完整事件数组（复盘主用）
+events.jsonl    进行中增量追加（崩溃安全），归档后即删除
+events.json     结束时归档的完整事件数组（复盘主用，唯一权威版本）
 meta.json       配置快照、模型分配、胜负结果
 contexts/       每个席位的完整消息历史快照（可选）
 ```

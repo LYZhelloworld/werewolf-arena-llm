@@ -11,10 +11,21 @@ const API_BASE: string =
   (import.meta.env.VITE_API_BASE as string | undefined)?.replace(/\/$/, "") ??
   "http://localhost:8000";
 
+// FastAPI 的错误体是 `{"detail": "..."}`；直接塞给用户看会带一层花括号和引号。
+function extractDetail(body: string): string {
+  try {
+    const parsed = JSON.parse(body) as { detail?: unknown };
+    if (typeof parsed.detail === "string") return parsed.detail;
+  } catch {
+    /* 不是 JSON，原样返回 */
+  }
+  return body;
+}
+
 async function jsonOrThrow(res: Response, what: string): Promise<unknown> {
   if (!res.ok) {
-    const detail = await res.text().catch(() => "");
-    throw new Error(`${what}失败（${res.status}）：${detail || res.statusText}`);
+    const body = await res.text().catch(() => "");
+    throw new Error(`${what}失败（${res.status}）：${extractDetail(body) || res.statusText}`);
   }
   return res.json();
 }

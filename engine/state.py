@@ -83,6 +83,37 @@ class Phase(StrEnum):
     GAME_OVER = "game_over"
 
 
+# 阶段的中文名。与 ``ROLE_LABELS`` 同理：枚举值保持英文（协议字段），展示层负责翻译。
+# **这里是唯一事实来源**——终端渲染器直接 import，``phase_enter`` 事件的 ``render.text``
+# 也用它生成；前端 ``web/src/lib/derive.ts`` 保留一份同内容的表（TS 里没法 import Python），
+# 由 ``tests/test_ts_types.py`` 做逐字一致性守卫，防止两边各自漂移。
+PHASE_LABELS: dict[str, str] = {
+    Phase.NIGHT_WOLF_CHAT: "夜晚 · 狼人协商",
+    Phase.NIGHT_WOLF_VOTE: "夜晚 · 狼人出刀",
+    Phase.NIGHT_WOLF_RUNOFF_SPEECH: "夜晚 · 狼人加时协商",
+    Phase.NIGHT_WOLF_RUNOFF_VOTE: "夜晚 · 狼人重新出刀",
+    Phase.NIGHT_SEER: "夜晚 · 预言家查验",
+    Phase.NIGHT_WITCH: "夜晚 · 女巫用药",
+    Phase.NIGHT_RESOLVE: "夜晚 · 结算",
+    Phase.NIGHT_HUNTER_SHOOT: "夜晚 · 猎人开枪",
+    Phase.DAY_ANNOUNCE: "白天 · 死亡公告",
+    Phase.DAY_DISCUSSION: "白天 · 自由讨论",
+    Phase.DAY_VOTE: "白天 · 投票",
+    Phase.DAY_RUNOFF_SPEECH: "白天 · 平票加时发言",
+    Phase.DAY_RUNOFF_VOTE: "白天 · 平票重投",
+    Phase.DAY_RESOLVE: "白天 · 出局结算",
+    Phase.LAST_WORDS: "遗言",
+    Phase.HUNTER_SHOOT: "猎人开枪",
+    Phase.POSTGAME: "赛后感想",
+    Phase.GAME_OVER: "对局结束",
+}
+
+
+def phase_label(phase: str) -> str:
+    """阶段英文值 → 中文标签。未知值原样返回，不吞掉信息。"""
+    return PHASE_LABELS.get(phase, phase)
+
+
 class Player(BaseModel):
     seat: int
     role: Role

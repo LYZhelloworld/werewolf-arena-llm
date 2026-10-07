@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { Event } from "../api/types";
-import { ALERT_TYPES, VIS_INFO, phaseLabel } from "../lib/derive";
+import { ALERT_TYPES, VIS_INFO, eventText, phaseLabel } from "../lib/derive";
 
 function CoT({ thinking }: { thinking: NonNullable<Event["thinking"]> }) {
   const [open, setOpen] = useState(false);
@@ -39,9 +39,7 @@ function EventItem({ e, godView }: { e: Event; godView: boolean }) {
         )}
         <span className="text-slate-500">{e.type}</span>
       </div>
-      <div className="mt-1 text-sm text-slate-100">
-        {e.render?.text ?? JSON.stringify(e.payload)}
-      </div>
+      <div className="mt-1 text-sm text-slate-100">{eventText(e)}</div>
       {godView && e.thinking && <CoT thinking={e.thinking} />}
       {e.llm && (
         <div className="mt-1 text-[10px] text-slate-500">

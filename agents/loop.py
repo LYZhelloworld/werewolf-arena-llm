@@ -6,6 +6,8 @@
 2. 动作工具参数非法 → 把**具体原因**作为 tool result 回给模型重选（不是直接报错）。
 3. 轮数用尽仍无合法动作 → 交给编排层兜底，并打 ``fallback`` 标记。
 4. 不使用 ``tool_choice="required"``——必须先允许模型调辅助工具。
+5. 模型只发言不调工具 → 先把它这段发言写进历史，再**点名本回合可用工具**
+   要它动手。既不静默丢掉它的输出，也不让历史退化成连续多条 user 消息。
 
 回传被 provider 拒绝（400）时的降级也在这里（§7.4.3）。
 """
@@ -30,11 +32,17 @@ from agents.tools import (
     is_think_tool,
 )
 from engine.actions import Action, LegalAction
-from engine.events import Event, Thinking, Visibility
+from engine.events import Event, RenderText, Thinking, Visibility
 from engine.state import GameState
 
 # 回传被拒时要从历史消息里剥掉的字段（auto 探测的候选 + 已确定的字段名）
 _STRIP_FIELDS = ("reasoning_content", "reasoning", "reasoning_text")
+
+# 模型「只说话不动手」时的纠正提示。**必须点名本回合实际可用的工具**：
+# 泛泛的「请调用一个工具」对弱模型没用，实测会一路说话到轮数用尽。
+_TOOL_REMINDER = (
+    "你只发言、没有调用工具，这一步还没有生效。请立刻调用一个工具行动，本回合可选：{tools}。"
+)
 
 
 class PendingEvent(BaseModel):
@@ -48,6 +56,9 @@ class PendingEvent(BaseModel):
     visibility: Visibility
     actor: int | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
+    # 展示文本。**每个事件都必须带上**——前端与回放 UI 只认这一份，
+    # 缺了就只能把 raw payload 当 JSON 摊给用户看（真实踩过）。
+    render: RenderText | None = None
 
 
 @dataclass
@@ -114,10 +125,11 @@ async def run_turn(
         )
 
         if not response.tool_calls:
-            # 模型只是说话没有行动：明确要求它调工具，再给一轮
-            context.messages.append(
-                {"role": "user", "content": "你必须通过调用工具来行动，请调用一个工具。"}
-            )
+            # 模型只是说话没有行动：先把这段发言写进历史，再点名工具要它动手。
+            # 不写发言的话，历史会退化成连续多条 user 消息（实测一局堆出 8 条），
+            # 而且模型看不到自己刚说过什么，只会把同一段话原样再说一遍。
+            _record_spoken_reply(context, response)
+            _ask_for_tool(context, tools)
             continue
 
         context.append_assistant(
@@ -134,27 +146,32 @@ async def run_turn(
                     str(call.arguments.get("key", "")), str(call.arguments.get("content", ""))
                 )
                 if ok:
+                    key = call.arguments.get("key")
+                    content = call.arguments.get("content")
                     outcome.pending_events.append(
                         PendingEvent(
                             type="memory_write",
                             visibility=Visibility.SELF,
                             actor=context.seat,
-                            payload={
-                                "key": call.arguments.get("key"),
-                                "content": call.arguments.get("content"),
-                            },
+                            payload={"key": key, "content": content},
+                            render=RenderText(
+                                text=f"{context.seat} 号 记下「{key}」：{content}",
+                            ),
                         )
                     )
                 results.append((call.id, name, text))
                 continue
 
             if name == MEMORY_READ:
+                keys = list(context.memories)
+                recalled = "、".join(keys) if keys else "（暂无记忆）"
                 outcome.pending_events.append(
                     PendingEvent(
                         type="memory_read",
                         visibility=Visibility.SELF,
                         actor=context.seat,
-                        payload={"keys": list(context.memories)},
+                        payload={"keys": keys},
+                        render=RenderText(text=f"{context.seat} 号 回忆：{recalled}"),
                     )
                 )
                 results.append((call.id, name, context.read_memory()))
@@ -190,6 +207,9 @@ async def run_turn(
                     visibility=Visibility.SPECTATOR,
                     actor=context.seat,
                     payload={"tool": name, "reason": detail},
+                    render=RenderText(
+                        text=f"{context.seat} 号 动作被拒（{name}）：{detail}",
+                    ),
                 )
             )
             results.append((call.id, name, detail))
@@ -244,6 +264,9 @@ async def _request(
                 visibility=Visibility.SPECTATOR,
                 actor=context.seat,
                 payload={"reason": detail, "status_code": exc.status_code},
+                render=RenderText(
+                    text=f"{context.seat} 号 CoT 回传被拒，已降级：{detail}",
+                ),
             )
         )
         return await client.achat(request)
@@ -274,6 +297,28 @@ def _as_tool_call_payload(call: Any) -> dict[str, Any]:
     }
 
 
+def _record_spoken_reply(context: AgentContext, response: LLMResponse) -> None:
+    """把「只说话没动手」的那次回复也留在历史里。
+
+    正文为空时不写——``{"role": "assistant"}`` 这种空消息会被部分服务端直接拒掉。
+    """
+    text = (response.content or "").strip()
+    if not text:
+        return
+    context.append_assistant(text, capture(response.raw, context.thinking), [])
+
+
+def _ask_for_tool(context: AgentContext, tools: list[dict[str, Any]]) -> None:
+    """点名本回合可用的工具，要求模型动手；同一条提示不重复堆叠。"""
+    names = "、".join(
+        spec["function"]["name"] for spec in tools if spec.get("function", {}).get("name")
+    )
+    reminder = _TOOL_REMINDER.format(tools=names or "（无）")
+    if context.messages and context.messages[-1].get("content") == reminder:
+        return
+    context.messages.append({"role": "user", "content": reminder})
+
+
 def _merge_thinking(target: Thinking, incoming: Thinking, context: AgentContext) -> None:
     """多轮时把各轮的 CoT 串起来，source 取第一个有意义的。"""
     if not incoming.text:
@@ -298,4 +343,5 @@ def build_event(outcome: PendingEvent, state: GameState, seq: int, game_id: str)
         visibility=outcome.visibility,
         actor=outcome.actor,
         payload=outcome.payload,
+        render=outcome.render,
     )

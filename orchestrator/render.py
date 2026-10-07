@@ -1,8 +1,12 @@
 """终端渲染：把事件流画成可读的中文观战文本。
 
-观众视角默认能看到一切（底牌、狼人频道、夜间死亡）；``--view N`` 切换成
-某位玩家的视角后，事件先过 ``engine.visibility.filter_events_for`` 再进渲染器，
-所以屏幕上剩下的应该正好是他该知道的——这是信息隔离最直观的自检方式。
+观众视角默认能看到一切（底牌、狼人频道、夜间死亡、每个席位的内心活动）；
+``--view N`` 切换成某位玩家的视角后，事件先过 ``engine.visibility.filter_events_for``
+再进渲染器，所以屏幕上剩下的应该正好是他该知道的——这是信息隔离最直观的自检方式。
+
+内心活动（CoT）**不需要单独的开关判断**：玩家视角的 ``event.thinking``
+已被过滤阶段物理置为 ``None``，渲染器只要「有就打印」，天然只对观众可见。
+``--no-cot`` 只是给观众一个「别刷屏」的开关。
 
 颜色只在交互式终端里开：管道输出、``NO_COLOR``、不支持 ANSI 的旧控制台
 一律降级为纯文本。
@@ -15,28 +19,7 @@ import sys
 from typing import Any, TextIO
 
 from engine.events import Event, Visibility
-from engine.state import ROLE_LABELS, DeathCause, Role
-
-PHASE_LABELS: dict[str, str] = {
-    "night_wolf_chat": "夜晚 · 狼人协商",
-    "night_wolf_vote": "夜晚 · 狼人出刀",
-    "night_wolf_runoff_speech": "夜晚 · 狼人加时协商",
-    "night_wolf_runoff_vote": "夜晚 · 狼人重新出刀",
-    "night_seer": "夜晚 · 预言家查验",
-    "night_witch": "夜晚 · 女巫用药",
-    "night_resolve": "夜晚 · 结算",
-    "night_hunter_shoot": "夜晚 · 猎人开枪",
-    "day_announce": "白天 · 死亡公告",
-    "day_discussion": "白天 · 自由讨论",
-    "day_vote": "白天 · 投票",
-    "day_runoff_speech": "白天 · 平票加时发言",
-    "day_runoff_vote": "白天 · 平票重投",
-    "day_resolve": "白天 · 出局结算",
-    "last_words": "遗言",
-    "hunter_shoot": "猎人开枪",
-    "postgame": "赛后感想",
-    "game_over": "对局结束",
-}
+from engine.state import PHASE_LABELS, ROLE_LABELS, DeathCause, Role
 
 CAUSE_LABELS: dict[str, str] = {
     DeathCause.KILL.value: "被狼人刀死",
@@ -94,11 +77,22 @@ def _enable_windows_ansi() -> None:
 class TerminalRenderer:
     """把事件逐条打印成中文行。"""
 
-    def __init__(self, stream: TextIO | None = None, color: bool | None = None) -> None:
+    def __init__(
+        self,
+        stream: TextIO | None = None,
+        color: bool | None = None,
+        show_thinking: bool = True,
+        cot_chars: int = 600,
+    ) -> None:
         self.stream = stream if stream is not None else sys.stdout
         if color is None:
             color = self._terminal_supports_color()
         self.color = color
+        # 观众视角下是否打印每个席位的内心活动（玩家视角本就没有可打）
+        self.show_thinking = show_thinking
+        # 单条内心活动最长打印多少字；<= 0 表示不截断。
+        # 本地小模型的 CoT 动辄数千字且大量重复，不截断会把终端刷爆。
+        self.cot_chars = cot_chars
         if color:
             _enable_windows_ansi()
         # 阶段标题延迟到该阶段第一条内容出现时再打，避免空阶段留下一堆孤零零的标题
@@ -134,6 +128,9 @@ class TerminalRenderer:
             if line is None:
                 continue
             self._flush_header()
+            thought = self._thinking_line(event)
+            if thought is not None:
+                self.write(thought)
             self.write(line)
 
     def _flush_header(self) -> None:
@@ -171,6 +168,25 @@ class TerminalRenderer:
         """私有频道的中文标记，公开事件为空串。"""
         mark = CHANNEL_MARKS.get(event.visibility.value)
         return self.paint(f"（{mark}）", "gray") if mark else ""
+
+    def _thinking_line(self, event: Event) -> str | None:
+        """观众视角下该席位此刻的内心活动。
+
+        玩家视角的 ``thinking`` 已在过滤阶段被物理剔除（恒为 ``None``），
+        所以这里「有就打印」天然只对观众可见，不会泄漏给玩家。
+        ``source`` 一并打出来，一眼看清 CoT 是从推理字段、正文还是 think 工具取的。
+        """
+        if not self.show_thinking or event.thinking is None:
+            return None
+        text = " ".join((event.thinking.text or "").split())
+        if not text:
+            return None
+        total = len(text)
+        if self.cot_chars > 0 and total > self.cot_chars:
+            text = f"{text[: self.cot_chars]}……（共 {total} 字）"
+        seat = f"{event.actor} 号" if event.actor is not None else "系统"
+        label = f"    〔内心〕{seat}（{event.thinking.source}）：{text}"
+        return self.paint(label, "dim", "magenta")
 
     def _seat(self, seat: Any) -> str:
         return self.paint(f"{seat} 号", "bold")
@@ -282,3 +298,40 @@ class TerminalRenderer:
     def _on_game_over(self, event: Event) -> str:
         winner = WINNER_LABELS.get(str(event.payload.get("winner")), "未知")
         return self.paint(f"\n=== 对局结束：{winner} ===", "bold", "green")
+
+    # ------------------------------------------------------------------
+    # agent 侧事件（记忆、兜底、非法动作、CoT 降级）——必须带上是谁做的
+    # ------------------------------------------------------------------
+
+    def _on_memory_write(self, event: Event) -> str:
+        key = event.payload.get("key", "")
+        content = event.payload.get("content", "")
+        return self.paint(
+            f"{self._channel(event)} {self._seat(event.actor)} 记下「{key}」：{content}", "dim"
+        )
+
+    def _on_memory_read(self, event: Event) -> str:
+        keys = event.payload.get("keys") or []
+        body = "、".join(str(k) for k in keys) if keys else "（暂无记忆）"
+        return self.paint(f"{self._channel(event)} {self._seat(event.actor)} 回忆：{body}", "dim")
+
+    def _on_action_fallback(self, event: Event) -> str:
+        reason = event.payload.get("reason", "")
+        return self.paint(
+            f"{self._channel(event)} {self._seat(event.actor)} 走兜底：{reason}", "yellow"
+        )
+
+    def _on_action_rejected(self, event: Event) -> str:
+        tool = event.payload.get("tool", "")
+        reason = event.payload.get("reason", "")
+        return self.paint(
+            f"{self._channel(event)} {self._seat(event.actor)} 动作被拒（{tool}）：{reason}",
+            "yellow",
+        )
+
+    def _on_llm_downgrade(self, event: Event) -> str:
+        reason = event.payload.get("reason", "")
+        return self.paint(
+            f"{self._channel(event)} {self._seat(event.actor)} CoT 回传被拒，已降级：{reason}",
+            "yellow",
+        )

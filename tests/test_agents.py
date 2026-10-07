@@ -16,15 +16,22 @@ import pytest
 from agents.client import ChatRequest, LLMError, LLMResponse, OpenAICompatClient, ToolCall
 from agents.context import AgentContext
 from agents.loop import TurnParams, run_turn
-from agents.mock import MockClient, auto_responder, tool_call
+from agents.mock import MockClient, auto_responder, speech, tool_call
 from agents.policy import LLMPolicy, SeatSpec, specs_from_models
-from agents.prompts import system_prompt
+from agents.prompts import phase_instruction, system_prompt
 from agents.tools import build_tools, call_to_action
-from config import AgentMemoryConfig, BoardConfig, GameConfig, ModelsConfig, ThinkingConfig
+from config import (
+    AgentMemoryConfig,
+    BoardConfig,
+    ConfigError,
+    GameConfig,
+    ModelsConfig,
+    ThinkingConfig,
+)
 from engine.actions import Action, ActionType, LegalAction
 from engine.engine import RuleEngine
 from engine.events import Event, Visibility
-from engine.state import GameState, Player, Role
+from engine.state import GameState, Phase, Player, Role
 from orchestrator.game_loop import GameRunner
 
 PARAMS = TurnParams(model="mock")
@@ -135,6 +142,10 @@ def test_memory_write_then_action_is_two_turns() -> None:
     assert outcome.tool_turns == 2
     assert ctx.memories == {"怀疑": "2 号发言很急"}
     assert [e.type for e in outcome.pending_events] == ["memory_write"]
+    # agent 侧事件同样要有展示文本，否则前端只能显示裸 JSON
+    assert outcome.pending_events[0].render is not None
+    assert "记下「怀疑」" in outcome.pending_events[0].render.text
+    assert "1 号" in outcome.pending_events[0].render.text
 
 
 def test_memory_read_returns_written_entries() -> None:
@@ -151,6 +162,8 @@ def test_memory_read_returns_written_entries() -> None:
     assert outcome.tool_turns == 3
     assert [e.type for e in outcome.pending_events] == ["memory_write", "memory_read"]
     assert any("k：v" in json.dumps(m, ensure_ascii=False) for m in ctx.messages)
+    assert outcome.pending_events[1].render is not None
+    assert "回忆：k" in outcome.pending_events[1].render.text
 
 
 def test_memory_limit_is_enforced() -> None:
@@ -180,12 +193,48 @@ def test_no_action_within_max_turns_falls_back() -> None:
 def test_model_that_only_talks_is_asked_to_call_tools() -> None:
     legal = [LegalAction(seat=1, type=ActionType.SPEAK)]
     client = MockClient([LLMResponse(content="我不服"), tool_call("speak", message="好吧")])
-    outcome = run(client, make_ctx(), make_state(), legal)
+    ctx = make_ctx()
+    outcome = run(client, ctx, make_state(), legal)
     assert outcome.action == Action(actor=1, type=ActionType.SPEAK, message="好吧")
-    assert any(
-        "必须通过调用工具来行动" in json.dumps(m, ensure_ascii=False)
-        for m in client.calls[1].messages
+    second = client.calls[1].messages
+    # 纠正提示要点名本回合实际可用的工具，而不是泛泛地「请调用一个工具」
+    assert any("没有调用工具" in json.dumps(m, ensure_ascii=False) for m in second)
+    assert any("speak" in json.dumps(m, ensure_ascii=False) for m in second)
+
+
+def test_spoken_reply_is_kept_before_the_tool_reminder() -> None:
+    """只说话的回复必须进历史：否则对话会变成连续多条 user，模型看不见自己说过什么。"""
+    legal = [LegalAction(seat=1, type=ActionType.SPEAK)]
+    client = MockClient(
+        [speech("我先说两句"), speech("我再补一句"), tool_call("speak", message="好吧")]
     )
+    ctx = make_ctx()
+    run(client, ctx, make_state(), legal)
+
+    roles = [m["role"] for m in ctx.messages]
+    # 不再出现连续两条 user（以前「催工具」提示会一条条往上叠）
+    assert all(not (roles[i] == "user" and roles[i + 1] == "user") for i in range(len(roles) - 1))
+    assert [m.get("content") for m in ctx.messages if m["role"] == "assistant"] == [
+        "我先说两句",
+        "我再补一句",
+        None,  # 最后一次是工具调用，正文为空
+    ]
+    # 每一次纠正提示都排在自己那段发言之后
+    for i, message in enumerate(ctx.messages):
+        if message["role"] == "user" and "没有调用工具" in str(message.get("content")):
+            assert ctx.messages[i - 1]["role"] == "assistant"
+
+
+def test_empty_replies_do_not_stack_the_same_reminder() -> None:
+    """模型连回空内容时，同一句纠正提示不该原样堆在历史里。"""
+    legal = [LegalAction(seat=1, type=ActionType.SPEAK)]
+    client = MockClient([LLMResponse() for _ in range(3)] + [tool_call("speak", message="好吧")])
+    ctx = make_ctx()
+    outcome = run(client, ctx, make_state(), legal)
+    assert outcome.action == Action(actor=1, type=ActionType.SPEAK, message="好吧")
+    assert sum("没有调用工具" in str(m.get("content")) for m in ctx.messages) == 1
+    # 空回复不该写进历史，否则会生成服务端拒收的空 assistant 消息
+    assert not any(m["role"] == "assistant" and not m.get("tool_calls") for m in ctx.messages)
 
 
 # --- CoT -------------------------------------------------------------------
@@ -496,6 +545,10 @@ def test_fallback_decision_is_marked_and_recorded() -> None:
     assert types[-1] == "action_fallback"
     assert types.count("action_rejected") == 4  # 4 次非法动作各留一条痕
     assert decision.side_events[-1].payload["reason"]
+    # 异常类事件也必须带展示文本与席位
+    assert all(e.render is not None and e.render.text for e in decision.side_events)
+    assert decision.side_events[-1].render is not None
+    assert "1 号 走兜底" in decision.side_events[-1].render.text
 
 
 def test_specs_from_models_resolves_provider_and_thinking() -> None:
@@ -541,8 +594,11 @@ def test_specs_from_models_resolves_provider_and_thinking() -> None:
     assert qwen.provider == "qwen"
     assert qwen.extra_body == {"preserve_thinking": True}
 
-    with pytest.raises(KeyError):
+    # 抄错模型名是最常见的手误，必须给出「可用模型」清单而不是裸的 KeyError
+    with pytest.raises(ConfigError) as excinfo:
         specs_from_models(models, {1: "不存在的模型"})
+    assert "不存在的模型" in str(excinfo.value)
+    assert "deepseek-chat" in str(excinfo.value) and "qwen3.8-max" in str(excinfo.value)
 
 
 def test_mock_client_records_requests_for_isolation_assertions() -> None:
@@ -551,6 +607,73 @@ def test_mock_client_records_requests_for_isolation_assertions() -> None:
     run(client, ctx, make_state(), [LegalAction(seat=1, type=ActionType.SPEAK)])
     assert client.call_count == 1
     assert "speak" in client.tool_names()
+
+
+# --- 板子配置进入 prompt ----------------------------------------------------
+
+
+def test_system_prompt_publishes_the_board() -> None:
+    """本局板子的公开配置必须写进 system prompt——模型不该靠猜规则。
+
+    实测中有模型在没有警长的板子上脑补出「警上争夺警徽」，根因就是没人告诉过它
+    本局的板子长什么样。
+    """
+    prompt = system_prompt(1, Player(seat=1, role=Role.VILLAGER), make_state())
+
+    assert "# 本局板子" in prompt
+    assert (
+        "9 人局：3 狼人、1 预言家、1 女巫、1 猎人、3 平民。当前规则下无警长和警徽竞选。" in prompt
+    )
+    assert "不公布死因" in prompt
+    assert "座位号 1 到 9" in prompt
+
+
+def test_board_brief_follows_config() -> None:
+    """板子一改，prompt 里的规则必须跟着改（不能写死一套默认规则）。"""
+    default_prompt = system_prompt(1, Player(seat=1, role=Role.WEREWOLF), make_state())
+
+    board = BoardConfig()
+    board.vote.secret_ballot = False
+    board.day.speech_max_chars = 120
+    board.roles.werewolf = 4
+    tweaked = GameState(game_id="t", players=make_state().players, board=board)
+    tweaked_prompt = system_prompt(1, Player(seat=1, role=Role.WEREWOLF), tweaked)
+
+    assert "同时投票" in default_prompt and "看不到别人投给谁" in default_prompt
+    assert "依次公开投票" in tweaked_prompt and "别人能看到你投给谁" in tweaked_prompt
+    assert "300 字" in default_prompt and "120 字" in tweaked_prompt
+    assert "9 人局" in default_prompt and "10 人局" in tweaked_prompt
+
+
+def test_board_section_is_identical_for_every_seat() -> None:
+    """板子是公开事实，所有席位的这一段必须一字不差（防止夹带只该某人知道的信息）。"""
+    state, _ = RuleEngine(BoardConfig(), seed=3).new_game()
+    sections = {
+        system_prompt(seat, player, state).split("# 本局板子\n")[1].split("\n\n# 与你相关的规则")[0]
+        for seat, player in state.players.items()
+    }
+    assert len(sections) == 1
+
+
+# --- 阶段指令必须点名工具 ---------------------------------------------------
+
+
+def test_speaking_phases_instruction_names_the_tool() -> None:
+    """说话类阶段的指令必须点名 ``speak``。
+
+    实测：狼人协商那一轮的指令只写了「说出你的建议」，9B 模型就老老实实写了段
+    发言然后结束回合，整轮 4 次请求全部白烧，最后走兜底「我没什么可说的」。
+    """
+    state = make_state(roles={1: Role.WEREWOLF, 2: Role.VILLAGER, 3: Role.VILLAGER})
+    for phase in (
+        Phase.NIGHT_WOLF_CHAT,
+        Phase.NIGHT_WOLF_RUNOFF_SPEECH,
+        Phase.DAY_DISCUSSION,
+        Phase.DAY_RUNOFF_SPEECH,
+    ):
+        state.phase = phase
+        text = phase_instruction(state, 1, [])
+        assert "speak" in text, f"{phase.value} 的指令没有点名工具：{text}"
 
 
 # --- 上下文压缩（M8） -------------------------------------------------------
@@ -679,6 +802,25 @@ def _fake_sdk_response() -> SimpleNamespace:
     return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=None)
 
 
+def _sdk_stub(create: Any) -> SimpleNamespace:
+    return SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+
+
+def _achat_with_injected_sdk(client: OpenAICompatClient, stub: SimpleNamespace) -> LLMResponse:
+    """注入替身 SDK 客户端后跑一次调用。
+
+    生产代码**按事件循环**缓存 SDK 客户端（见 ``OpenAICompatClient._sdk``），所以注入必须
+    发生在 running loop 里；在 loop 外赋值会被当成「上一批留下的客户端」而被换掉。
+    """
+
+    async def go() -> LLMResponse:
+        client._client = stub  # type: ignore[assignment]
+        client._loop = asyncio.get_running_loop()
+        return await client.achat(ChatRequest(model="m", messages=[]))
+
+    return asyncio.run(go())
+
+
 def test_network_retries_are_counted(monkeypatch: pytest.MonkeyPatch) -> None:
     """客户端自管重试：可重试错误重试后成功，并把次数记进响应（DESIGN §7.7）。"""
     monkeypatch.setattr("agents.client._backoff_seconds", lambda _n: 0.0)
@@ -695,10 +837,7 @@ def test_network_retries_are_counted(monkeypatch: pytest.MonkeyPatch) -> None:
             return _fake_sdk_response()
 
     flaky = _Flaky()
-    client._client = SimpleNamespace(  # type: ignore[assignment]
-        chat=SimpleNamespace(completions=SimpleNamespace(create=flaky.create))
-    )
-    response = asyncio.run(client.achat(ChatRequest(model="m", messages=[])))
+    response = _achat_with_injected_sdk(client, _sdk_stub(flaky.create))
     assert response.network_retries == 2
     assert flaky.attempts == 3
 
@@ -717,12 +856,57 @@ def test_non_retryable_error_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> 
             raise _Boom(400)
 
     failing = _AlwaysFail()
-    client._client = SimpleNamespace(  # type: ignore[assignment]
-        chat=SimpleNamespace(completions=SimpleNamespace(create=failing.create))
-    )
+    stub = _sdk_stub(failing.create)
     with pytest.raises(LLMError):
-        asyncio.run(client.achat(ChatRequest(model="m", messages=[])))
+        _achat_with_injected_sdk(client, stub)
     assert failing.attempts == 1
+
+
+def test_programming_error_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    """没有状态码 ≠ 网络问题：编程错误必须立刻炸出来，不能被重试掩盖。
+
+    真实教训：编排层每个阶段一次 ``asyncio.run``，而 SDK 客户端的连接池绑在创建它的
+    loop 上，跨 loop 复用会抛 ``RuntimeError: Event loop is closed``（status 为 None）。
+    旧逻辑「没状态码就重试」把它当成网络抖动，一局 9 人局刷出 25 次假重试，
+    观战界面上全显示成橙色「重试」，看起来像网络差。
+    """
+    monkeypatch.setattr("agents.client._backoff_seconds", lambda _n: 0.0)
+    client = OpenAICompatClient(base_url="http://x", api_key="k", network_retries=3)
+
+    class _Broken:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        async def create(self, **_kwargs: Any) -> Any:
+            self.attempts += 1
+            raise RuntimeError("Event loop is closed")
+
+    broken = _Broken()
+    stub = _sdk_stub(broken.create)
+    with pytest.raises(LLMError):
+        _achat_with_injected_sdk(client, stub)
+    assert broken.attempts == 1  # 只试了一次，没有重试
+
+
+def test_sdk_client_is_rebuilt_when_the_event_loop_changes() -> None:
+    """跨事件循环换一套 SDK 客户端：httpx 连接池不能跟着 loop 一起被带走。
+
+    这是上面那个坑的正面守卫——不是「重试成功了」，而是「根本不该失败」。
+    """
+    client = OpenAICompatClient(base_url="http://x", api_key="k")
+
+    async def grab() -> tuple[int, Any]:
+        return id(client._sdk()), client._loop
+
+    first_id, first_loop = asyncio.run(grab())
+    second_id, second_loop = asyncio.run(grab())
+    assert first_loop is not second_loop
+    assert first_id != second_id  # 换了 loop 就换了客户端
+
+    async def twice() -> bool:
+        return client._sdk() is client._sdk()
+
+    assert asyncio.run(twice())  # 同一个 loop 内不会反复重建
 
 
 class _RetryCountClient:

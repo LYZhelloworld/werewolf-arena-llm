@@ -3,6 +3,9 @@
 为什么两个都要：单个 JSON 数组无法安全增量追加——写到一半崩溃会留下语法
 损坏的文件，这一局的复盘数据就全没了。进行中用 JSON Lines（崩溃最多丢最后
 一行），结束时再一次性归档成完整数组。两者都是 JSON，不引入二进制数据库。
+
+jsonl 只是**进行中的临时载体**：归档出 ``events.json`` 之后立即删掉，
+否则同一份事件会以两种格式各留一份（实测两个文件加起来约 1.1 倍体积）。
 """
 
 from __future__ import annotations
@@ -50,8 +53,13 @@ class EventLog:
             os.fsync(handle.fileno())
 
     def archive(self, events: list[Event]) -> Path:
-        """把完整事件数组归档为 ``events.json``。复盘主要读这个文件。"""
+        """把完整事件数组归档为 ``events.json``，随后删掉进行中的 ``events.jsonl``。
+
+        两者内容等价（json 是权威版本），归档后留着 jsonl 只是白白多占一份空间。
+        顺序是「先写 json，再删 jsonl」：万一写 json 失败抛错，jsonl 还在，不至于两头空。
+        """
         atomic_write_json(self.json_path, [e.model_dump(mode="json") for e in events])
+        self.jsonl_path.unlink(missing_ok=True)
         return self.json_path
 
     def write_meta(self, meta: dict) -> Path:

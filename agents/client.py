@@ -13,10 +13,13 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
-from openai import NOT_GIVEN, AsyncOpenAI
+from openai import NOT_GIVEN, APIConnectionError, APITimeoutError, AsyncOpenAI
 from pydantic import BaseModel, Field
+
+if TYPE_CHECKING:
+    from asyncio import AbstractEventLoop
 
 
 class ToolCall(BaseModel):
@@ -69,12 +72,21 @@ class LLMClient(Protocol):
 
     async def achat(self, request: ChatRequest) -> LLMResponse: ...
 
+    async def aclose(self) -> None: ...
+
 
 class OpenAICompatClient:
     """AsyncOpenAI 的薄封装。
 
-    网络重试**自己做**（不用 SDK 的 ``max_retries``），这样才能把重试次数
-    记进 :class:`LLMResponse`，进而在事件里可见（DESIGN.md §7.7 / §8.2）。
+    这里处理两个容易踩的坑：
+
+    - **网络重试自己做**（不用 SDK 的 ``max_retries``），这样才能把重试次数
+      记进 :class:`LLMResponse`，进而在事件里可见（DESIGN.md §7.7 / §8.2）。
+    - **SDK 客户端与事件循环绑定**：编排层每个阶段用一次 ``asyncio.run``，每次都创建
+      **全新的** event loop；而 ``httpx`` 的连接池属于创建它的那个 loop，跨 loop 复用会抛
+      ``RuntimeError: Event loop is closed``（``status_code`` 为 None，正好落进「连接类错误」
+      可重试分支）。实测一局 9 人局因此产生了 **25 次假重试**——每个阶段的第一条请求必中一次，
+      观战界面上全被标成橙色的「重试」。故按 loop 缓存 SDK 客户端，换 loop 就换一套。
     """
 
     def __init__(
@@ -85,20 +97,34 @@ class OpenAICompatClient:
         network_retries: int = 3,
     ) -> None:
         self.base_url = base_url
+        self.api_key = api_key
+        self.timeout_s = timeout_s
         self.max_network_retries = max(0, network_retries)
-        self._client = AsyncOpenAI(
-            base_url=base_url,
-            api_key=api_key,
-            timeout=timeout_s,
-            max_retries=0,  # 重试由本类接管，便于计数
-        )
+        self._client: AsyncOpenAI | None = None
+        self._loop: AbstractEventLoop | None = None
+
+    def _sdk(self) -> AsyncOpenAI:
+        """取**当前事件循环**可用的 SDK 客户端；loop 变了就换一套。"""
+        loop = asyncio.get_running_loop()
+        if self._client is None or self._loop is not loop:
+            # 旧客户端绑在已关闭的 loop 上，连接也一并作废。不主动关它：``aclose()``
+            # 本身就要在原来那个 loop 里 await，关不掉；只剩内存，交给 GC。
+            self._client = AsyncOpenAI(
+                base_url=self.base_url,
+                api_key=self.api_key,
+                timeout=self.timeout_s,
+                max_retries=0,  # 重试由本类接管，便于计数
+            )
+            self._loop = loop
+        return self._client
 
     async def achat(self, request: ChatRequest) -> LLMResponse:
         started = time.perf_counter()
         retries = 0
+        client = self._sdk()
         while True:
             try:
-                response = await self._client.chat.completions.create(
+                response = await client.chat.completions.create(
                     model=request.model,
                     messages=request.messages,  # type: ignore[arg-type]
                     tools=request.tools if request.tools else NOT_GIVEN,  # type: ignore[arg-type]
@@ -108,7 +134,7 @@ class OpenAICompatClient:
                 )
             except Exception as exc:  # SDK 的异常类型很多，统一收敛成 LLMError
                 status = getattr(exc, "status_code", None)
-                if retries < self.max_network_retries and _is_retryable(status):
+                if retries < self.max_network_retries and _is_retryable(exc, status):
                     retries += 1
                     await asyncio.sleep(_backoff_seconds(retries))
                     continue
@@ -146,18 +172,32 @@ class OpenAICompatClient:
         )
 
     async def aclose(self) -> None:
-        await self._client.close()
+        if self._client is not None:
+            await self._client.close()
 
 
 # 值得重试的 HTTP 状态：限流与常见服务端/网关抖动
 RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
 
+# 没有状态码时可重试的异常类型：SDK 把传输层异常统一包装成这两种。
+NETWORK_ERRORS = (APIConnectionError, APITimeoutError)
 
-def _is_retryable(status: int | None) -> bool:
-    """``status`` 为 None 视为连接类错误（超时 / DNS / 连接重置），同样值得重试。"""
-    if status is None:
+# SDK 之外还可能漏出 httpx / httpcore / ssl 的原生传输层异常，按模块名兜住。
+_TRANSPORT_MODULES = frozenset({"httpx", "httpcore", "ssl"})
+
+
+def _is_retryable(exc: Exception, status: int | None) -> bool:
+    """这次失败值不值得重发一遍。
+
+    **不能**退化成「凡是没状态码就重试」——那样会把编程错误当成网络抖动反复重发，
+    把真正的 bug 藏起来（真实教训：``RuntimeError: Event loop is closed`` 被重试了 25 次，
+    界面上全显示成橙色「重试」，看起来像网络差，实际是连接池用错了事件循环）。
+    """
+    if status is not None:
+        return status in RETRYABLE_STATUS
+    if isinstance(exc, NETWORK_ERRORS):
         return True
-    return status in RETRYABLE_STATUS
+    return type(exc).__module__.split(".", 1)[0] in _TRANSPORT_MODULES
 
 
 def _backoff_seconds(attempt: int) -> float:

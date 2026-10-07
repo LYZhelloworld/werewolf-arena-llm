@@ -92,6 +92,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="用随机策略跑，完全不产生 LLM 调用（压规则用，最快）",
     )
     parser.add_argument("--no-color", action="store_true", help="关闭彩色输出")
+    parser.add_argument(
+        "--no-cot", action="store_true", help="观众视角下不打印各席位的内心活动（默认打印）"
+    )
+    parser.add_argument(
+        "--cot-chars",
+        type=int,
+        default=600,
+        help="单条内心活动最多打印多少字，0 表示不截断（默认 600）",
+    )
     parser.add_argument("--no-save", action="store_true", help="不写入 data/ 存档")
     parser.add_argument(
         "--config-dir",
@@ -126,22 +135,32 @@ def _visible_to(batch: list[Event], state: GameState, seat: int | None) -> list[
 
 
 def build_policy(
-    args: argparse.Namespace, game: GameConfig, total_seats: int
+    game: GameConfig,
+    total_seats: int,
+    *,
+    model: str | None = None,
+    random: bool = False,
+    seed: int | None = None,
+    config_dir: Path = DEFAULT_CONFIG_DIR,
 ) -> tuple[object, dict[str, str]]:
     """按参数构造策略，返回 ``(policy, 席位→模型名)``。
 
-    ``--model`` 没给就用脚本化客户端顶替 LLM：链路照跑，不产生任何费用。
+    ``model`` 没给就用脚本化客户端顶替 LLM：链路照跑，不产生任何费用。
+
+    参数刻意写成显式关键字而非 ``argparse.Namespace``：CLI 与服务层共用本函数，
+    而 Namespace 的鸭子类型让「少传一个字段」只能等到运行时才炸 —— 服务层就曾因为
+    少传 ``config_dir`` 而在 POST /games 时抛 AttributeError（500）。
     """
     seats = list(range(1, total_seats + 1))
-    if args.random:
-        return RandomPolicy(seed=args.seed), {str(s): "random" for s in seats}
-    if args.model is None:
+    if random:
+        return RandomPolicy(seed=seed), {str(s): "random" for s in seats}
+    if model is None:
         client = MockClient(auto_responder())
         specs = {seat: SeatSpec(provider="mock", model=MOCK_MODEL) for seat in seats}
         return LLMPolicy({"mock": client}, specs, game), {str(s): MOCK_MODEL for s in seats}
 
-    models: ModelsConfig = load_models(args.config_dir)  # 缺 key 会在这里退出
-    assignment = {seat: args.model for seat in seats}
+    models: ModelsConfig = load_models(config_dir)  # 缺 key 会在这里退出
+    assignment = {seat: model for seat in seats}
     specs = specs_from_models(models, assignment)
     clients = {}
     for name, provider in models.providers.items():
@@ -153,7 +172,7 @@ def build_policy(
                 network_retries=models.defaults.network_retries,
             )
     policy = LLMPolicy(clients, specs, game, models.defaults)
-    return policy, {str(seat): args.model for seat in seats}
+    return policy, {str(seat): model for seat in seats}
 
 
 def play_one_game(
@@ -247,13 +266,19 @@ def main(argv: list[str] | None = None) -> int:
     total_seats = sum(int(v) for v in board.roles.model_dump().values())
     view_seat = parse_view(args.view, total_seats)
     show_detail = not args.summary
-    renderer = TerminalRenderer(color=not args.no_color)
+    renderer = TerminalRenderer(
+        color=not args.no_color, show_thinking=not args.no_cot, cot_chars=args.cot_chars
+    )
 
     if show_detail and view_seat is not None:
         renderer.write(f"（以 {view_seat} 号视角观战：看不到底牌、狼人频道与别人的私有信息）")
 
     if args.model is not None and not args.summary:
-        models_cfg = load_models(args.config_dir)
+        try:
+            models_cfg = load_models(args.config_dir)  # 缺文件 / 缺 key 在这里就有中文提示
+        except ConfigError as exc:
+            print(exc, file=sys.stderr)
+            return 1
         renderer.write("API key 来源：")
         for line in api_key_report(models_cfg):
             renderer.write(line)
@@ -262,7 +287,19 @@ def main(argv: list[str] | None = None) -> int:
     results = []
     for i in range(args.games):
         # 每局都要新的上下文：角色重新分配，agent 的历史不能串局
-        policy, models_map = build_policy(args, game, total_seats)
+        try:
+            policy, models_map = build_policy(
+                game,
+                total_seats,
+                model=args.model,
+                random=args.random,
+                seed=args.seed,
+                config_dir=args.config_dir,
+            )
+        except ConfigError as exc:
+            # 模型名写错 / models.yaml 缺字段：给中文提示，别甩 traceback
+            print(exc, file=sys.stderr)
+            return 1
         results.append(
             play_one_game(
                 board,

@@ -51,6 +51,8 @@ def test_append_then_archive_keeps_every_event(tmp_path: Path) -> None:
     assert [e["seq"] for e in archived] == [1, 2, 3, 4, 5]
     # ts 是 datetime，归档后必须变成 JSON 字符串
     assert isinstance(archived[0]["ts"], str)
+    # jsonl 只是进行中的临时载体，归档后必须删掉，不留两份等价数据
+    assert not log.jsonl_path.exists()
 
 
 def test_archive_leaves_no_temp_files(tmp_path: Path) -> None:
@@ -58,6 +60,14 @@ def test_archive_leaves_no_temp_files(tmp_path: Path) -> None:
     log.archive(_events(2))
     leftovers = [p.name for p in log.dir.iterdir() if p.suffix == ".tmp"]
     assert leftovers == []
+
+
+def test_archive_without_appending_still_works(tmp_path: Path) -> None:
+    """没追加过 jsonl 也要能归档（重复归档同理，不能因缺文件而失败）。"""
+    log = EventLog(tmp_path, "g1")
+    log.archive(_events(2))
+    log.archive(_events(2))
+    assert json.loads(log.json_path.read_text(encoding="utf-8"))[0]["seq"] == 1
 
 
 def test_meta_records_board_fingerprint_and_result(tmp_path: Path) -> None:

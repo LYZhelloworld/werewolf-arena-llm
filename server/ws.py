@@ -14,6 +14,9 @@
 - 每个 ``GameHandle`` 持有一份内存事件列表（``events``）做回放历史。观战者连上 WS：
   先回灌「截至此刻的快照」作为历史，再订阅队列接实时。快照拷贝与入队在 ``lock`` 下原子
   完成，二者之间不会漏事件、也不会重复。
+- **只有本进程开过的对局才有句柄**。服务重启后，``data/games/*`` 里的历史对局不在内存中，
+  ``get()`` 返回 ``None``——这类对局由调用方（``app.py`` 的 WS 处理器）改走
+  ``events_for()`` 读归档、一次性放完再 ``done``。
 """
 
 from __future__ import annotations
@@ -202,10 +205,23 @@ class GameManager:
     @staticmethod
     def seat_role(handle: GameHandle, seat: int) -> Role:
         """从 ``role_assigned`` 事件里取该座位的角色（避免重新发牌）。"""
-        for event in handle.events:
+        return _role_for_seat(handle.events, seat)
+
+    def total_seats(self, game_id: str) -> int | None:
+        """该局的座位总数；内存里没有就按归档的发牌结果推。找不到对局返回 ``None``。
+
+        WS 需要用它在建立连接前拦掉越界座位号——不校验的话会一路走到取角色时才炸。
+        """
+        handle = self.games.get(game_id)
+        if handle is not None:
+            return sum(int(v) for v in handle.board.roles.model_dump().values())
+        events = _load_archived(self.root, game_id)
+        if events is None:
+            return None
+        for event in events:
             if event.type == "role_assigned":
-                return Role(event.payload["roles"][str(seat)])
-        return Role.VILLAGER
+                return len(event.payload["roles"])
+        return None
 
     # ------------------------------------------------------------------
     # 回放读取
@@ -247,14 +263,7 @@ class GameManager:
                 return None
             events = loaded
         if seat is not None:
-            role = (
-                Role(
-                    next(e.payload["roles"][str(seat)] for e in events if e.type == "role_assigned")
-                )
-                if any(e.type == "role_assigned" for e in events)
-                else Role.VILLAGER
-            )
-            events = ViewFilter(seat, role).apply(events)
+            events = ViewFilter(seat, _role_for_seat(events, seat)).apply(events)
         return events
 
     def meta_for(self, game_id: str) -> GameMeta | None:
@@ -274,6 +283,19 @@ class GameManager:
                 event_count=event_count,
             )
         return None
+
+
+def _role_for_seat(events: list[Event], seat: int) -> Role:
+    """从发牌事件里取该座位的角色。
+
+    取不到（事件缺失或座位号越界）退化为**平民**——平民视角只有公开信息，
+    错也不会错到把私有频道漏出去。
+    """
+    for event in events:
+        if event.type == "role_assigned":
+            name = event.payload.get("roles", {}).get(str(seat))
+            return Role(name) if name is not None else Role.VILLAGER
+    return Role.VILLAGER
 
 
 def _load_archived(root: str | Path, game_id: str) -> list[Event] | None:

@@ -11,7 +11,7 @@ import pytest
 from config import BoardConfig
 from engine.actions import Action, ActionType, LegalAction
 from engine.engine import RuleEngine
-from engine.events import Event, Visibility
+from engine.events import Event, Thinking, Visibility
 from engine.state import GameState, Phase
 from orchestrator.cli import main
 from orchestrator.game_loop import GameRunner
@@ -29,6 +29,7 @@ def _event(
     phase: str = "day_discussion",
     actor: int | None = None,
     payload: dict | None = None,
+    thinking: Thinking | None = None,
 ) -> Event:
     return Event(
         seq=seq,
@@ -39,6 +40,7 @@ def _event(
         visibility=visibility,
         actor=actor,
         payload=payload or {},
+        thinking=thinking,
     )
 
 
@@ -168,6 +170,136 @@ def test_renderer_color_is_off_for_pipes() -> None:
     assert TerminalRenderer(stream=buf, color=True).paint("x", "red") == "\033[31mx\033[0m"
 
 
+def test_renderer_shows_memory_events_with_actor() -> None:
+    """记忆读写必须带上是哪个席位做的，否则观众认不出是谁写的。"""
+    buf = io.StringIO()
+    renderer = TerminalRenderer(stream=buf, color=False)
+    renderer.render(
+        [
+            _event(
+                1,
+                "memory_write",
+                visibility=Visibility.SELF,
+                actor=5,
+                payload={"key": "身份", "content": "5号是猎人"},
+            ),
+            _event(
+                2,
+                "memory_read",
+                visibility=Visibility.SELF,
+                actor=9,
+                payload={"keys": ["8号遗言"]},
+            ),
+        ]
+    )
+    text = buf.getvalue()
+    assert "5 号" in text and "记下「身份」：5号是猎人" in text
+    assert "9 号" in text and "8号遗言" in text
+    assert "（仅本人可见）" in text
+
+
+def test_renderer_shows_agent_alert_events() -> None:
+    """兜底 / 非法动作 / CoT 降级都要带上席位与原因，不能只剩一个裸 payload。"""
+    buf = io.StringIO()
+    renderer = TerminalRenderer(stream=buf, color=False)
+    renderer.render(
+        [
+            _event(
+                1,
+                "action_rejected",
+                visibility=Visibility.SPECTATOR,
+                actor=3,
+                payload={"tool": "vote", "reason": "目标不在可选范围"},
+            ),
+            _event(
+                2,
+                "llm_downgrade",
+                visibility=Visibility.SPECTATOR,
+                actor=4,
+                payload={"reason": "回传 thinking 被拒"},
+            ),
+            _event(
+                3,
+                "action_fallback",
+                visibility=Visibility.SPECTATOR,
+                actor=6,
+                payload={"reason": "轮数用尽"},
+            ),
+        ]
+    )
+    text = buf.getvalue()
+    assert "3 号 动作被拒（vote）：目标不在可选范围" in text
+    assert "4 号 CoT 回传被拒，已降级：回传 thinking 被拒" in text
+    assert "6 号 走兜底：轮数用尽" in text
+
+
+def test_renderer_prints_thinking_when_present() -> None:
+    """观众视角下把该席位的内心活动打在它的动作之前。"""
+    buf = io.StringIO()
+    renderer = TerminalRenderer(stream=buf, color=False)
+    renderer.render(
+        [
+            _event(
+                1,
+                "speech",
+                actor=8,
+                payload={"message": "我是预言家"},
+                thinking=Thinking(text="我昨晚验了 1 号，是狼。", source="reasoning_content"),
+            ),
+            _event(2, "speech", actor=2, payload={"message": "我先听听"}),
+        ]
+    )
+    text = buf.getvalue()
+    assert "〔内心〕8 号（reasoning_content）：我昨晚验了 1 号，是狼。" in text
+    # 没有 thinking 的事件不该凭空多出一行
+    assert text.count("〔内心〕") == 1
+    # 内心活动要排在对应动作之前
+    assert text.index("〔内心〕") < text.index("8 号：我是预言家")
+
+
+def test_renderer_no_cot_switch_hides_thinking() -> None:
+    buf = io.StringIO()
+    renderer = TerminalRenderer(stream=buf, color=False, show_thinking=False)
+    renderer.render(
+        [
+            _event(
+                1,
+                "speech",
+                actor=8,
+                payload={"message": "喂"},
+                thinking=Thinking(text="秘密想法", source="content"),
+            )
+        ]
+    )
+    text = buf.getvalue()
+    assert "〔内心〕" not in text
+    assert "8 号：喂" in text
+
+
+def test_renderer_truncates_long_thinking_but_can_be_disabled() -> None:
+    """本地小模型的 CoT 很长，默认截断；--cot-chars 0 时不截断。"""
+    long_text = "想" * 900
+    event = _event(
+        1,
+        "speech",
+        actor=1,
+        payload={"message": "喂"},
+        thinking=Thinking(text=long_text, source="content"),
+    )
+
+    buf = io.StringIO()
+    TerminalRenderer(stream=buf, color=False, cot_chars=100).render([event])
+    text = buf.getvalue()
+    assert "想" * 100 in text
+    assert "想" * 101 not in text
+    assert "……（共 900 字）" in text
+
+    buf2 = io.StringIO()
+    TerminalRenderer(stream=buf2, color=False, cot_chars=0).render([event])
+    assert "想" * 900 in buf2.getvalue()
+    assert "……" not in buf2.getvalue()
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -203,7 +335,8 @@ def test_cli_writes_archive(config_dir: Path, tmp_path: Path, monkeypatch) -> No
     game_dirs = [p for p in (tmp_path / "data" / "games").iterdir() if p.is_dir()]
     assert len(game_dirs) == 1
     game_dir = game_dirs[0]
-    assert (game_dir / "events.jsonl").exists()
     assert (game_dir / "events.json").exists()
     assert (game_dir / "meta.json").exists()
     assert (tmp_path / "data" / "games" / "index.json").exists()
+    # 归档后 jsonl 是多余的，必须清掉——只留一份权威事件数据
+    assert not (game_dir / "events.jsonl").exists()
