@@ -141,8 +141,9 @@ Orchestrator（对局编排）
 - [x] M0 仓库骨架与配置样例
 - [x] M1 规则引擎（纯确定性 + 单测，含信息隔离测试）
 - [x] M2 CLI 随机策略跑通整局（彩色输出 + 事件流落盘 JSON）
-- [x] M3 接入 LLM、多轮工具循环、CoT 捕获（记忆工具已随 M3 提前实现）
-- [ ] M5 FastAPI + WebSocket 服务化
+- [x] M3 接入 LLM、多轮工具循环、CoT 捕获
+- [x] M4 记忆工具（memory_write / memory_read，随 M3 提前实现）
+- [x] M5 FastAPI + WebSocket 服务化（REST 启动/回放 + WS 实时事件流）
 - [ ] M6 前端实时观战 + CoT 面板
 - [ ] M7 回放与视角切换
 - [ ] M8 遗言、赛后感想与打磨

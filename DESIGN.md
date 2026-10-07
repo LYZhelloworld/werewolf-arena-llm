@@ -447,8 +447,13 @@ class BatchPolicy(Protocol):
 
 - 同步策略与异步策略共用同一个 `GameRunner`；
 - 单次 `asyncio.run` 的开销（一局约 30 批）可忽略；
-- M5 做 FastAPI + WebSocket 时再把主循环整体 async 化，届时 `decide_all`
-  改为 `await` 即可，编排层其余部分不动。
+- **M5 实际落地（见 §14 v0.10）**：没有把主循环整体 async 化，而是让一局对局跑在
+  **独立守护线程**里（见 `server/ws.py`）。原因——服务层要同时服务 REST 请求与
+  WebSocket 推送，若用 `loop.run_in_executor` 把同步 `GameRunner` 丢进事件循环线程池，
+  在「请求间隙循环被暂停」的网关 / 测试环境下后台任务会卡死。独立线程不依赖循环是否被
+  持续驱动，最稳。`decide_all` 内部那次 `asyncio.run` 在独立线程里照常工作；实时推送改用
+  普通线程安全队列（`queue.Queue`），WebSocket 处理器在自己的循环上用
+  `loop.run_in_executor(None, q.get)` 取批次下发，从而与「每次请求新 loop」的测试环境也兼容。
 
 ### 5.4 兜底链
 
@@ -1071,7 +1076,10 @@ werewolf-arena-llm/
 │   ├── render.py                # 终端彩色渲染（中文）
 │   └── cli.py                   # python -m orchestrator.cli
 ├── server/
-│   ├── app.py / ws.py / schemas.py
+│   ├── app.py                # FastAPI 应用工厂 + REST（启动 / 回放）+ WebSocket 实时推送
+│   ├── ws.py                 # GameManager / GameHandle：后台线程跑局、线程安全队列推送、回放读取
+│   ├── schemas.py            # 启动对局的请求 / 响应 schema
+│   └── __init__.py
 ├── storage/                     # 全 JSON 持久化
 │   ├── atomic.py                # 临时文件 + os.replace 原子写
 │   ├── event_log.py             # JSONL 追加 + 结束归档 events.json
@@ -1093,8 +1101,8 @@ werewolf-arena-llm/
 | **M1 规则引擎** | 9 人局完整状态机，纯确定性，**零 LLM** | `engine/` + 完整单测（含信息隔离测试） |
 | **M2 CLI 跑通** | 用规则随机策略（非 LLM）跑完整局，终端彩色输出，**顺带把持久化做掉** | `python -m orchestrator.cli` 能打完一局并写出 `data/games/{game_id}/` |
 | **M3 接入 LLM** | AgentRuntime + 多轮工具循环 + CoT 捕获 | 9 个模型打完一局，思考与发言全部落盘 |
-| **M4 记忆工具** | `memory_write` / `memory_read` 与上限保护 | 记忆可见于复盘 |
-| **M5 服务化** | FastAPI + WebSocket | REST + WS 可用 |
+| **M4 记忆工具** | `memory_write` / `memory_read` 与上限保护 | **已随 M3 实现**（见 §14 v0.9）：工具挂在 AgentRuntime 的 ReAct 循环里，条目数与字数受 `agent.memory` 上限保护 |
+| **M5 服务化** | FastAPI + WebSocket | REST 启动 / 回放 + WS 实时事件流可用（后台线程跑局，独立队列解耦） |
 | **M6 前端观战** | 大厅 + 对局房间，实时观战 + CoT 面板 | React 应用可看直播 |
 | **M7 回放** | 历史对局列表、回放页、视角切换 | 复盘功能完整 |
 | **M8 打磨** | 遗言 / 赛后感想、异常提示、性能优化 | |
@@ -1144,3 +1152,4 @@ werewolf-arena-llm/
 | 2026-10-07 | v0.7 | M2 编排层与持久化落地，同时把「策略缝」与「同时投票调度」写成显式约定：<br>1. **新增 §5.3 策略缝**：编排层不依赖 LLM，只依赖极窄的 `Policy.decide(state, legal) -> Action`。`legal` 只含单个席位的合法动作；M2 用 `RandomPolicy` 顶替 LLM 把链路跑通，M3 换 `AgentRuntime` 时编排层不改。<br>2. **同时投票的调度约定**（§5.3）：一个阶段内所有待行动席位基于**同一份状态快照**决策，先决策者的选择不进入后决策者上下文，动作收齐后才逐个交引擎结算。「投票期间互不看见」靠这一条保证，而非事后过滤。<br>3. **新增 §5.4 兜底链**：非法动作 → 引擎 `IllegalActionError` → 编排层记 `Rejection` 并改用 `FirstLegalPolicy`（取最小目标）继续；M3 起先在工具循环里带原因回给模型重试，用尽才走兜底。任何兜底必须留痕。<br>4. **持久化从 M3 提前到 M2**（§12）：CLI 跑完一局不落盘就没法复盘，且用户反复要求「一切产出都要落盘」。M3 只需要在事件里补 LLM 与 CoT 字段。<br>5. **§8.1 补 `index.json` 的字段定义**（game_id / started_at / seed / models / winner / days / event_count / path），§9.2 的 `meta.json` 补 `finished_at` 与 `survivors`，并把示例里的 `winner: werewolf` 修正为枚举值 `wolf`。<br>6. **§11 目录结构**补齐 `orchestrator/`（policies / game_loop / render / cli）与 `storage/`（atomic / event_log / meta / index）。<br>7. 新增 `engine.state.ROLE_LABELS`：角色中文名集中放在引擎侧，供终端与后续前端复用，避免各处重复硬编码。 |
 | 2026-10-07 | v0.8 | API key 支持两条来源，优先级「配置文件明文 > 环境变量」：<br>1. `ProviderConfig` 新增 `api_key: SecretStr | None`；`api_key_env` 改为可留空（默认 `""`）。<br>2. 新增 `resolve_api_key(provider)`：明文 → 环境变量 → 都没有则抛 `ConfigError`（`required=False` 时返回 None 供启动校验用）。<br>3. `_validate_api_key_env` 改名 `_validate_api_keys`：只在两条来源**都没有**时才报错，且错误信息同时给出 export 与写明文两条修复命令。<br>4. 新增 `mask_key()` 与 `api_key_report()`：启动日志输出脱敏来源（`sk-a***7890`），明文覆盖环境变量时明确标注「（环境变量已设置但被明文覆盖）」。<br>5. **安全约束**：明文用 `SecretStr` 承载，`repr` / `model_dump` 不回显；异常信息永不回显 key；key 绝不写入事件流、`meta.json` 或任何持久化 JSON。<br>6. `load_models(check_env=)` 参数改名 `check_keys=`（此前无外部调用点，改名无成本）。<br>7. §3.2 补 key 来源表与新的报错示例，R10 风险条目改写为「gitignore + SecretStr + 脱敏日志」三道防线。 |
 | 2026-10-07 | v0.9 | M3 接入 LLM：Agent 运行时落地，含记忆工具（原 M4 提前）：<br>1. **§5.3.1 策略缝扩展**：新增可选批量缝 `decide_all(state, legal) -> list[Decision]`。`Decision` 携带 `thinking` / `llm` 元信息 / `side_events`（记忆读写、兜底留痕）。编排层优先用它，没有则退回逐个 `decide()`，M2 的同步测试因此不受影响。<br>2. **§5.3.2 并发**：主循环保持同步，LLM 策略在 `decide_all` 内部用一次 `asyncio.run` + `gather` 并发打完本阶段所有席位，受全局与 provider 级信号量约束。M5 服务化时把它改成 `await` 即可，编排层其余不动。<br>3. **新增 `agents/`**：`client`（AsyncOpenAI 薄封装）/ `mock`（脚本化客户端，开发期不碰真 key）/ `thinking`（CoT 捕获与回传）/ `tools`（function schema）/ `loop`（多轮 ReAct）/ `context`（每席位独立历史）/ `prompts`（中文模板）/ `policy`（LLMPolicy）。<br>4. **prompt 模板移到 `agents/prompts.py`**（§7.6）：`engine/` 必须保持零 I/O 纯净性。<br>5. **CoT 三来源已实现**：原生 `reasoning_content`（按 `thinking.field` 配置）→ 正文 `content` → `think()` 工具；回传走**独立字段**决不拼进 `content`；遇 400 按 `replay_on_error` 剥离重试并降级本 agent 的 `replay`；`fail` 策略不重试。<br>6. **事件 schema 补 `llm` 字段**（§8.2）：`LlmMeta` 定义在 `engine/events.py`（纯数据，无 LLM 依赖），记录 provider / model / 延迟 / token / 工具轮数 / 是否兜底。<br>7. **记忆工具随 M3 一起做**（原计划 M4）：`memory_write` / `memory_read`，条目数与字数上限按 `agent.memory` 配置，事件以 `private:self` 落盘。<br>8. **上下文压缩延后**：M3 用增量追加（每次只追加「自上次行动以来的新事件」），`context.max_public_events` 的滑动窗口留到 M8。 |
+| 2026-10-07 | v0.10 | M5 服务化（FastAPI + WebSocket），同时并入 M4 文档修正：<br>1. **架构**：React 前端 → FastAPI/WS → Orchestrator → (规则引擎 | Agent 运行时)，引擎与 LLM 互不知晓。<br>2. **关键设计决策**：不把 `GameRunner` 整体 async 化，而是让每局跑在**独立守护线程**里；实时推送**不依赖事件循环**——worker 线程把事件批次放进每个订阅者的普通 `queue.Queue`（线程安全），WebSocket 处理器在自己的事件循环上用 `loop.run_in_executor(None, q.get)` 取批次下发。这样兼容 TestClient（每次请求新 loop）与 uvicorn（单 loop 常驻）。<br>3. **新增 `server/` 包**：`app.py`（路由 + 全开 CORS + `create_app(config_dir, root=None)` 工厂，启动即 `load_board`/`load_game` 校验）、`ws.py`（`GameManager` / `GameHandle`：后台线程跑局、锁保护下 `events.extend` + 写 `event_log` + 遍历 `subscribers` 做 `q.put`、跑完归档 `meta`/`contexts`/`index` 再发 `done`/`error`）、`schemas.py`（`CreateGameRequest` / `CreateGameResponse`）、`__init__.py`。<br>4. **REST 路由**：`POST /games`（构造策略、捕获 `ConfigError`→400、返回 `game_id` + `status`）、`GET /games`、`GET /games/{id}`、`GET /games/{id}/events?seat=`（按 seat 用 `ViewFilter`）。WS：`GET /games/{id}/ws?seat=`（backfill 经 `ViewFilter` 过滤后回灌，再实时推流，终态 `done`/`error` 关闭）。<br>5. **信息隔离在观战流落地**：WS 与 REST 均通过 `ViewFilter` 按 seat 过滤，物理剔除 `thinking`、随 `death` 事件实时关闭私有频道；与 `replay_view` / `view_for` / `filter_events_for` 同源。<br>6. **`engine/visibility.py` 新增 `ViewFilter`**：持有 `seat/role/alive`，`apply(events)` 增量过滤，遇 `death` 且 `actor==seat` 则 `alive=False`，返回的 `thinking` 恒为 None。`replay_view` 改为 `ViewFilter(seat, role).apply(events)`。<br>7. **M4 文档修正并入**：README 路线图补回 M4（已随 M3 实现）；DESIGN §11 里程碑表 M4 行加注「已随 M3 实现（见 §14 v0.9）」、§5.3.2 并发段落改写（明确 M5 实际未整体 async 化，而是后台线程 + 独立队列解耦，引用本版）、§11 目录结构 `server/` 展开为 `app.py / ws.py / schemas.py / __init__.py`。<br>8. **测试**：`tests/test_server.py` 4 个用例（创建并回放 / WS 完整推流 / 座位视角过滤私有频道 / 缺失对局 404），后台线程对局需 `_wait_done` 轮询 `handle.done` 后才读回放；pytest 105 passed、ruff、mypy 全绿。<br>9. **依赖**：`fastapi` 0.142.2 / `uvicorn` 0.54.0 加运行依赖，`httpx` 0.28.1 加测试依赖。 |
