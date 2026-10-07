@@ -109,6 +109,17 @@ class RandomPolicy:
         return _fill(self.rng.choice(templates), sample)
 
 
+def deterministic_action(legal: list[LegalAction]) -> Action:
+    """确定性兜底动作：取第一个需要目标的动作，目标取最小座位号。
+
+    不依赖任何状态，便于在各处（编排层、LLM 策略的兜底分支）复用。
+    """
+    spec = next((la for la in legal if la.allowed_targets), legal[0])
+    target = min(spec.allowed_targets) if spec.allowed_targets else None
+    message = "我没什么可说的。" if spec.type in SPEAKING_TYPES else None
+    return Action(actor=spec.seat, type=spec.type, target=target, message=message)
+
+
 class FirstLegalPolicy:
     """确定性策略：永远取第一个动作、最小目标。
 
@@ -117,7 +128,4 @@ class FirstLegalPolicy:
     """
 
     def decide(self, state: GameState, legal: list[LegalAction]) -> Action:
-        spec = next((la for la in legal if la.allowed_targets), legal[0])
-        target = min(spec.allowed_targets) if spec.allowed_targets else None
-        message = "我没什么可说的。" if spec.type in SPEAKING_TYPES else None
-        return Action(actor=spec.seat, type=spec.type, target=target, message=message)
+        return deterministic_action(legal)

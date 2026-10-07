@@ -1,8 +1,10 @@
 """命令行入口：跑一局（或多局）对局，终端彩色输出并落盘为 JSON。
 
-M2 阶段用的是随机策略而非 LLM——目的是在接入模型之前，先把规则引擎、
-编排层与持久化端到端跑通。接 LLM 之后本文件的流程不用改，
-只换掉注入的 Policy。
+策略有两种，由参数决定：
+
+- ``--mock``（默认）：脚本化客户端顶替 LLM，不需要 API key。
+  用来验证编排、工具协议、CoT 捕获与持久化链路。
+- ``--model NAME``：接真实模型，9 席全部用这一个模型（会有实际费用）。
 
 用法::
 
@@ -10,6 +12,7 @@ M2 阶段用的是随机策略而非 LLM——目的是在接入模型之前，�
     uv run python -m orchestrator.cli --view 3         # 以 3 号玩家的视角观战
     uv run python -m orchestrator.cli --games 50 --summary   # 批量跑，只看结果
     uv run python -m orchestrator.cli --no-save        # 不落盘，只看终端
+    uv run python -m orchestrator.cli --model deepseek-chat   # 接真实模型
 """
 
 from __future__ import annotations
@@ -20,7 +23,20 @@ import time
 from datetime import UTC, datetime
 from pathlib import Path
 
-from config import BoardConfig, ConfigError, GameConfig, load_board, load_game
+from agents.client import OpenAICompatClient
+from agents.mock import MockClient, auto_responder
+from agents.policy import LLMPolicy, SeatSpec, specs_from_models
+from config import (
+    BoardConfig,
+    ConfigError,
+    GameConfig,
+    ModelsConfig,
+    api_key_report,
+    load_board,
+    load_game,
+    load_models,
+    resolve_api_key,
+)
 from engine.engine import RuleEngine
 from engine.events import Event
 from engine.state import GameState
@@ -34,6 +50,7 @@ from storage.meta import build_meta
 
 DEFAULT_CONFIG_DIR = Path(__file__).resolve().parent.parent / "configs"
 SPECTATOR_VIEWS = ("spectator", "god", "all")
+MOCK_MODEL = "mock"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -59,6 +76,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="视角：spectator（默认，上帝视角）或座位号 1-9",
     )
     parser.add_argument("--summary", action="store_true", help="只打印每局一行摘要")
+    parser.add_argument(
+        "--model",
+        default=None,
+        help="用 configs/models.yaml 里的哪个模型（默认 --mock，不接真实模型）",
+    )
+    parser.add_argument(
+        "--mock",
+        action="store_true",
+        help="用脚本化客户端顶替 LLM（默认行为），不需要 API key",
+    )
+    parser.add_argument(
+        "--random",
+        action="store_true",
+        help="用随机策略跑，完全不产生 LLM 调用（压规则用，最快）",
+    )
     parser.add_argument("--no-color", action="store_true", help="关闭彩色输出")
     parser.add_argument("--no-save", action="store_true", help="不写入 data/ 存档")
     parser.add_argument(
@@ -93,12 +125,45 @@ def _visible_to(batch: list[Event], state: GameState, seat: int | None) -> list[
     return filter_events_for(batch, seat, player.role, player.alive)
 
 
+def build_policy(
+    args: argparse.Namespace, game: GameConfig, total_seats: int
+) -> tuple[object, dict[str, str]]:
+    """按参数构造策略，返回 ``(policy, 席位→模型名)``。
+
+    ``--model`` 没给就用脚本化客户端顶替 LLM：链路照跑，不产生任何费用。
+    """
+    seats = list(range(1, total_seats + 1))
+    if args.random:
+        return RandomPolicy(seed=args.seed), {str(s): "random" for s in seats}
+    if args.model is None:
+        client = MockClient(auto_responder())
+        specs = {seat: SeatSpec(provider="mock", model=MOCK_MODEL) for seat in seats}
+        return LLMPolicy({"mock": client}, specs, game), {str(s): MOCK_MODEL for s in seats}
+
+    models: ModelsConfig = load_models(args.config_dir)  # 缺 key 会在这里退出
+    assignment = {seat: args.model for seat in seats}
+    specs = specs_from_models(models, assignment)
+    clients = {}
+    for name, provider in models.providers.items():
+        if any(spec.provider == name for spec in specs.values()):
+            clients[name] = OpenAICompatClient(
+                provider.base_url,
+                resolve_api_key(provider),
+                timeout_s=models.defaults.timeout_s,
+                network_retries=models.defaults.network_retries,
+            )
+    policy = LLMPolicy(clients, specs, game, models.defaults)
+    return policy, {str(seat): args.model for seat in seats}
+
+
 def play_one_game(
     board: BoardConfig,
     game: GameConfig,
     seed: int | None,
     view_seat: int | None,
     renderer: TerminalRenderer,
+    policy: object,
+    models_map: dict[str, str],
     *,
     show_detail: bool,
     delay: float,
@@ -125,20 +190,24 @@ def play_one_game(
     if show_detail:
         renderer.render(_visible_to(opening, state, view_seat))
 
-    runner = GameRunner(engine, RandomPolicy(seed=seed), on_events=on_events)
+    runner = GameRunner(engine, policy, on_events=on_events)  # type: ignore[arg-type]
     state, collected = runner.run(state)
     events = opening + collected
 
     if log is not None:
         log.archive(events)
-        log.write_meta(build_meta(state, started_at=started_at))
+        log.write_meta(build_meta(state, started_at=started_at, models=models_map))
+        # 每个席位的完整消息历史，事后可逐条复盘（§8.4）
+        if game.persist.dump_agent_contexts:
+            for seat, context in sorted(getattr(policy, "contexts", {}).items()):
+                log.write_context(seat, context.snapshot())
         update_index(
             game.persist.root,
             {
                 "game_id": state.game_id,
                 "started_at": started_at.isoformat(),
                 "seed": seed,
-                "models": {},  # M2 还没有模型，占位
+                "models": models_map,
                 "winner": state.winner.value if state.winner else None,
                 "days": state.day,
                 "event_count": len(events),
@@ -183,20 +252,31 @@ def main(argv: list[str] | None = None) -> int:
     if show_detail and view_seat is not None:
         renderer.write(f"（以 {view_seat} 号视角观战：看不到底牌、狼人频道与别人的私有信息）")
 
+    if args.model is not None and not args.summary:
+        models_cfg = load_models(args.config_dir)
+        renderer.write("API key 来源：")
+        for line in api_key_report(models_cfg):
+            renderer.write(line)
+
     started = time.perf_counter()
-    results = [
-        play_one_game(
-            board,
-            game,
-            seed=None if args.seed is None else args.seed + i,
-            view_seat=view_seat,
-            renderer=renderer,
-            show_detail=show_detail,
-            delay=args.delay,
-            save=not args.no_save,
+    results = []
+    for i in range(args.games):
+        # 每局都要新的上下文：角色重新分配，agent 的历史不能串局
+        policy, models_map = build_policy(args, game, total_seats)
+        results.append(
+            play_one_game(
+                board,
+                game,
+                seed=None if args.seed is None else args.seed + i,
+                view_seat=view_seat,
+                renderer=renderer,
+                policy=policy,
+                models_map=models_map,
+                show_detail=show_detail,
+                delay=args.delay,
+                save=not args.no_save,
+            )
         )
-        for i in range(args.games)
-    ]
     elapsed = time.perf_counter() - started
 
     if not show_detail or args.games > 1:

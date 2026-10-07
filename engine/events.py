@@ -40,6 +40,23 @@ class Thinking(BaseModel):
     replayed: bool = False
 
 
+class LlmMeta(BaseModel):
+    """一次 LLM 调用的可观测信息（DESIGN.md §8.2）。
+
+    放在 ``engine/events.py`` 而不是 ``agents/``：事件 schema 必须由引擎侧统一定义，
+    且它只是纯数据，不含任何 LLM 依赖。``fallback`` 表示这一手是兜底出来的。
+    """
+
+    provider: str
+    model: str
+    latency_ms: int = 0
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    tool_turns: int = 0
+    network_retries: int = 0
+    fallback: bool = False
+
+
 class Event(BaseModel):
     """一条事件。落盘为 JSON（jsonl 追加 / json 归档）。"""
 
@@ -53,4 +70,5 @@ class Event(BaseModel):
     actor: int | None = None  # None 表示系统
     payload: dict[str, Any] = Field(default_factory=dict)
     thinking: Thinking | None = None
+    llm: LlmMeta | None = None
     render: RenderText | None = None

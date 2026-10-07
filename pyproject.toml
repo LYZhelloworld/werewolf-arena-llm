@@ -5,6 +5,7 @@ description = "让 9 个大语言模型坐在一桌打狼人杀，供人类实�
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "openai>=3.26.0",
     "pydantic>=2.9",
     "pyyaml>=6.0",
 ]

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, overload
 
 import yaml
 from pydantic import BaseModel, Field, SecretStr, ValidationError
@@ -337,6 +337,14 @@ def _validate_api_keys(cfg: ModelsConfig, path: Path) -> None:
 # ---------------------------------------------------------------------------
 # API key
 # ---------------------------------------------------------------------------
+
+
+@overload
+def resolve_api_key(provider: ProviderConfig, required: Literal[True] = True) -> str: ...
+
+
+@overload
+def resolve_api_key(provider: ProviderConfig, required: Literal[False]) -> str | None: ...
 
 
 def resolve_api_key(provider: ProviderConfig, required: bool = True) -> str | None:

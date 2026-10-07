@@ -408,12 +408,47 @@ class Policy(Protocol):
 - 出参就是一个 `Action`，和引擎唯一认的输入类型一致。
 
 这条缝的意义：**M2 用 `RandomPolicy` 顶替 LLM 把整条链路跑通，M3 换成
-`AgentRuntime` 时编排层一行都不用改**。随机策略故意会做出各种蠢事
+`LLMPolicy` 时编排层的同步主循环一行都不用改**。随机策略故意会做出各种蠢事
 （自刀、毒队友、弃权），正好用来压规则边界。
 
 **同时投票的调度约定**：一个阶段内所有待行动席位都基于**同一份状态快照**
 决策，先决策者的选择不会进入后决策者的上下文；动作收齐后才逐个交给引擎
 结算。「投票期间互不看见」就是靠这一条保证的，不是靠事后过滤。
+
+#### 5.3.1 M3 扩展：批量决策与 `Decision`
+
+同步的 `decide()` 装不下 LLM 的两样东西：**并发**（同一阶段多个席位要同时打 API）
+和**元信息**（CoT、token 用量、工具轮数、记忆读写这些都要落盘，见 §8.4）。
+因此增加一条**可选**的批量缝，只有 LLM 策略实现它：
+
+```python
+class Decision(BaseModel):
+    action: Action  # 交给引擎的仍然是同一个 Action
+    thinking: Thinking | None = None  # CoT，恒为观众可见
+    llm: LlmMeta | None = None  # provider / model / 延迟 / token / 轮数 / fallback
+    side_events: list[Event] = []  # 记忆读写、被拒动作等，编号后并入事件流
+
+
+class BatchPolicy(Protocol):
+    def decide_all(self, state: GameState, legal: list[LegalAction]) -> list[Decision]: ...
+```
+
+- 编排层**优先**用 `decide_all`，没有实现就退回逐个 `decide()`（M2 的同步测试因此不受影响）。
+- `side_events` 在动作事件**之前**编号入流（先记下记忆、再行动，顺序才符合直觉）。
+- `thinking` / `llm` 由编排层**附加到该动作产生的第一个事件**上，而不是另起一条事件——
+  CoT 与它导致的那个动作必须绑在一起，否则复盘时会对不上。
+- `fallback: true` 由工具循环写进 `llm` 元信息（§8.5），前端据此打标记。
+
+#### 5.3.2 并发：同步外壳 + 内部 asyncio 批处理
+
+编排层主循环保持**同步**（M2 的测试与 CLI 都建立在它上面），LLM 策略在
+`decide_all` 内部用一次 `asyncio.run` + `asyncio.gather` 把本阶段所有席位并发打完，
+受 §7.7 的信号量约束。这样：
+
+- 同步策略与异步策略共用同一个 `GameRunner`；
+- 单次 `asyncio.run` 的开销（一局约 30 批）可忽略；
+- M5 做 FastAPI + WebSocket 时再把主循环整体 async 化，届时 `decide_all`
+  改为 `await` 即可，编排层其余部分不动。
 
 ### 5.4 兜底链
 
@@ -760,6 +795,11 @@ Provider 差异一律走配置，不在代码里写 `if provider == "moonshot"`�
 - 超出时对最早的公开事件做**滑动窗口丢弃**，并在丢弃处插入一行模板摘要：
   「（前情提要：第 1 天 4 号被投出局，2 号与 7 号互相指控……）」。
 - MVP 阶段摘要由模板规则生成（死亡公告 + 投票结果 + 每轮首句），不额外调 LLM。
+
+**M3 实际做法**：上下文采用**增量追加**——每次决策只把「自上次行动以来的新事件」
+渲染成一条 user 消息追加进历史，不重渲染全量历史。因此 `max_public_events`
+的滑动窗口**暂未实现**，单局消息数上限约等于「决策次数 × 3」，
+9 人局通常在 60 条消息以内，尚不构成压力。压缩留到 M8 打磨阶段。
 - 自己的 CoT 是否留在上下文里由 `thinking.replay` 统一决定（§7.4.2），不再单独设开关：
   有原生推理的模型走结构化字段回传，无原生推理的模型其正文 CoT 本就在历史里。
 
@@ -789,7 +829,9 @@ Provider 差异一律走配置，不在代码里写 `if provider == "moonshot"`�
 - 发言不超过 300 字，说人话，像一个真实的玩家，可以撒谎、可以伪装。
 ```
 
-每个角色一份模板（`engine/prompts/{role}.md`），运行时注入变量。
+模板放在 **`agents/prompts.py`**（不是 `engine/prompts/`）：
+`engine/` 必须保持零 I/O 的纯净性（§5 原则 3），而 prompt 模板天然属于 LLM 层。
+按角色一份中文模板，运行时注入变量。
 
 ### 7.7 并发与限流
 
@@ -1015,12 +1057,14 @@ werewolf-arena-llm/
 │   ├── phases.py                # 阶段状态机（setup / resolve）
 │   └── prompts/                 # 各角色中文 prompt 模板
 ├── agents/                      # LLM 运行时
-│   ├── runtime.py               # OpenAI 兼容客户端 + 并发
-│   ├── context.py               # AgentContext（独立历史，剔除他人 CoT）
-│   ├── tools.py                 # 各阶段 tool schema（动作 + 记忆）
-│   ├── loop.py                  # 多轮工具循环
-│   ├── thinking.py              # CoT 捕获（多源兼容）
-│   └── retry.py                 # 重试 / 兜底
+│   ├── client.py                # OpenAI 兼容客户端（AsyncOpenAI，只换 base_url）
+│   ├── mock.py                  # MockClient：脚本化响应，无 key 也能开发与测试
+│   ├── thinking.py              # CoT 捕获（多源兼容）+ 回传决策
+│   ├── tools.py                 # 各阶段 tool schema（动作 + 记忆 + 可选 think）
+│   ├── loop.py                  # 多轮 ReAct 工具循环
+│   ├── context.py               # AgentContext（每席位独立历史，落盘 contexts/）
+│   ├── prompts.py               # 中文 system prompt 与阶段指令模板
+│   └── policy.py                # LLMPolicy：实现 Policy + decide_all 批量并发
 ├── orchestrator/                # 唯一同时认识引擎与决策方的层
 │   ├── policies.py              # Policy 协议 + RandomPolicy（M2 顶替 LLM）
 │   ├── game_loop.py             # 主循环、同时投票调度、兜底
@@ -1099,3 +1143,4 @@ werewolf-arena-llm/
 | 2026-10-07 | v0.6 | M1 规则引擎开工前补齐的规则空白与前两版的措辞歧义：<br>1. **女巫解药语义明确**（§4.5）：解药作用对象**固定为「今夜刀口」**，女巫只决定救或不救，**不能另选救人目标**，故 `witch_save()` 无参数。`self_save` / `self_save_first_night_only` **仅在刀口恰好是女巫本人时生效**；刀口是别人时不受限。今夜空刀则解药无从使用。<br>2. **狼人出刀平票规则明确**（§4.7）：原措辞「平票狼各发言一轮 / 座位号最小的狼决定刀口」含糊且需要额外一轮动作，现明确为——**全体存活狼人**再发言一轮 → 重投（候选项限定为平票目标）→ 二次平票取**平票候选中座位号最小者**（确定性兜底，不追加第三轮）。<br>3. **新增 §4.10 阶段枚举**：列出全部 18 个 Phase 的英文值。明确**猎人夜间死亡在夜间就触发开枪**（`night_hunter_shoot`），结果计入当夜死亡名单随 `day_announce` 公布——与 §4.3 步骤 5 一致。区分「需 LLM 行动的阶段」与「引擎自动结算推进的阶段」（`night_resolve` / `day_announce` / `day_resolve`）。<br>4. **新增 §4.11 投票事件可见性**：为落实「投票期间互不看见」，`vote_cast` / `vote_abstain` 在逐个提交时 **visibility = spectator**（任何 agent 都看不到），计票完成后才发 `vote_result`（白天 public / 狼人出刀 private:wolf）。即 agent 只能看到计完票的结果，看不到谁投了谁。同理夜间 `death` 事件为 spectator，到 `day_announce` 才以 public 的 `night_deaths_announced` 公布名单且不公布死因；白天被票/被枪的 `death` 直接 public。<br>5. **新增 event type `roles_revealed`**（§8.3）：赛后感想前向全体揭示真实身份，public。<br>6. **目录结构调整**（§11）：新增根级 `config.py`（Pydantic schema + 加载与启动校验）、`engine/actions.py`、`engine/events.py`，把状态/动作/事件三类模型拆开，避免 `state.py` 过度膨胀。 |
 | 2026-10-07 | v0.7 | M2 编排层与持久化落地，同时把「策略缝」与「同时投票调度」写成显式约定：<br>1. **新增 §5.3 策略缝**：编排层不依赖 LLM，只依赖极窄的 `Policy.decide(state, legal) -> Action`。`legal` 只含单个席位的合法动作；M2 用 `RandomPolicy` 顶替 LLM 把链路跑通，M3 换 `AgentRuntime` 时编排层不改。<br>2. **同时投票的调度约定**（§5.3）：一个阶段内所有待行动席位基于**同一份状态快照**决策，先决策者的选择不进入后决策者上下文，动作收齐后才逐个交引擎结算。「投票期间互不看见」靠这一条保证，而非事后过滤。<br>3. **新增 §5.4 兜底链**：非法动作 → 引擎 `IllegalActionError` → 编排层记 `Rejection` 并改用 `FirstLegalPolicy`（取最小目标）继续；M3 起先在工具循环里带原因回给模型重试，用尽才走兜底。任何兜底必须留痕。<br>4. **持久化从 M3 提前到 M2**（§12）：CLI 跑完一局不落盘就没法复盘，且用户反复要求「一切产出都要落盘」。M3 只需要在事件里补 LLM 与 CoT 字段。<br>5. **§8.1 补 `index.json` 的字段定义**（game_id / started_at / seed / models / winner / days / event_count / path），§9.2 的 `meta.json` 补 `finished_at` 与 `survivors`，并把示例里的 `winner: werewolf` 修正为枚举值 `wolf`。<br>6. **§11 目录结构**补齐 `orchestrator/`（policies / game_loop / render / cli）与 `storage/`（atomic / event_log / meta / index）。<br>7. 新增 `engine.state.ROLE_LABELS`：角色中文名集中放在引擎侧，供终端与后续前端复用，避免各处重复硬编码。 |
 | 2026-10-07 | v0.8 | API key 支持两条来源，优先级「配置文件明文 > 环境变量」：<br>1. `ProviderConfig` 新增 `api_key: SecretStr | None`；`api_key_env` 改为可留空（默认 `""`）。<br>2. 新增 `resolve_api_key(provider)`：明文 → 环境变量 → 都没有则抛 `ConfigError`（`required=False` 时返回 None 供启动校验用）。<br>3. `_validate_api_key_env` 改名 `_validate_api_keys`：只在两条来源**都没有**时才报错，且错误信息同时给出 export 与写明文两条修复命令。<br>4. 新增 `mask_key()` 与 `api_key_report()`：启动日志输出脱敏来源（`sk-a***7890`），明文覆盖环境变量时明确标注「（环境变量已设置但被明文覆盖）」。<br>5. **安全约束**：明文用 `SecretStr` 承载，`repr` / `model_dump` 不回显；异常信息永不回显 key；key 绝不写入事件流、`meta.json` 或任何持久化 JSON。<br>6. `load_models(check_env=)` 参数改名 `check_keys=`（此前无外部调用点，改名无成本）。<br>7. §3.2 补 key 来源表与新的报错示例，R10 风险条目改写为「gitignore + SecretStr + 脱敏日志」三道防线。 |
+| 2026-10-07 | v0.9 | M3 接入 LLM：Agent 运行时落地，含记忆工具（原 M4 提前）：<br>1. **§5.3.1 策略缝扩展**：新增可选批量缝 `decide_all(state, legal) -> list[Decision]`。`Decision` 携带 `thinking` / `llm` 元信息 / `side_events`（记忆读写、兜底留痕）。编排层优先用它，没有则退回逐个 `decide()`，M2 的同步测试因此不受影响。<br>2. **§5.3.2 并发**：主循环保持同步，LLM 策略在 `decide_all` 内部用一次 `asyncio.run` + `gather` 并发打完本阶段所有席位，受全局与 provider 级信号量约束。M5 服务化时把它改成 `await` 即可，编排层其余不动。<br>3. **新增 `agents/`**：`client`（AsyncOpenAI 薄封装）/ `mock`（脚本化客户端，开发期不碰真 key）/ `thinking`（CoT 捕获与回传）/ `tools`（function schema）/ `loop`（多轮 ReAct）/ `context`（每席位独立历史）/ `prompts`（中文模板）/ `policy`（LLMPolicy）。<br>4. **prompt 模板移到 `agents/prompts.py`**（§7.6）：`engine/` 必须保持零 I/O 纯净性。<br>5. **CoT 三来源已实现**：原生 `reasoning_content`（按 `thinking.field` 配置）→ 正文 `content` → `think()` 工具；回传走**独立字段**决不拼进 `content`；遇 400 按 `replay_on_error` 剥离重试并降级本 agent 的 `replay`；`fail` 策略不重试。<br>6. **事件 schema 补 `llm` 字段**（§8.2）：`LlmMeta` 定义在 `engine/events.py`（纯数据，无 LLM 依赖），记录 provider / model / 延迟 / token / 工具轮数 / 是否兜底。<br>7. **记忆工具随 M3 一起做**（原计划 M4）：`memory_write` / `memory_read`，条目数与字数上限按 `agent.memory` 配置，事件以 `private:self` 落盘。<br>8. **上下文压缩延后**：M3 用增量追加（每次只追加「自上次行动以来的新事件」），`context.max_public_events` 的滑动窗口留到 M8。 |
