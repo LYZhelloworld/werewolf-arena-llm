@@ -7,6 +7,9 @@
 配置优先级（同 OpenCode 的 provider → model → variant）：
 ``defaults`` → provider 级 → model 级，后者覆盖前者，嵌套对象深合并。
 
+**API key**：两条来源，优先级为「配置文件明文 ``api_key`` > 环境变量 ``api_key_env``」。
+明文用 ``SecretStr`` 承载，异常信息与启动日志一律脱敏，绝不回显完整 key。
+
 **引擎纯净性**：``engine/`` 只能 import 本文件的 **schema 类**（``BoardConfig`` 等），
 **绝不能 import 加载函数**（``load_board`` / ``load_all`` 等）——那些会读文件、读环境变量。
 加载只发生在进程启动与 CLI / 服务层。
@@ -19,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, SecretStr, ValidationError
 
 CONFIG_DIR = Path(__file__).parent / "configs"
 
@@ -206,8 +209,16 @@ class ModelEntry(BaseModel):
 
 
 class ProviderConfig(BaseModel):
+    """单个 provider。
+
+    key 有两条来源，**配置文件明文优先**（见 ``resolve_api_key``）：
+    ``api_key`` 明文 > ``api_key_env`` 指向的环境变量。二者都没有即启动报错。
+    ``api_key`` 用 :class:`SecretStr`，``print`` / ``model_dump(mode="json")`` 都只会得到掩码。
+    """
+
     base_url: str
-    api_key_env: str
+    api_key_env: str = ""  # 环境变量名；留空表示只用明文
+    api_key: SecretStr | None = None
     max_concurrency: int | None = None
     thinking: ThinkingConfig | None = None
     # provider 级非标准请求体字段，与 model 级 extra_body 深合并
@@ -276,14 +287,14 @@ def load_game(config_dir: Path = CONFIG_DIR) -> GameConfig:
     return _parse(GameConfig, data, path)
 
 
-def load_models(config_dir: Path = CONFIG_DIR, check_env: bool = True) -> ModelsConfig:
+def load_models(config_dir: Path = CONFIG_DIR, check_keys: bool = True) -> ModelsConfig:
     path = config_dir / "models.yaml"
     data = _read_yaml(path, f"{(config_dir / 'models.example.yaml').as_posix()}")
     cfg = _parse(ModelsConfig, data, path)
 
     _validate_thinking(cfg, path)
-    if check_env:
-        _validate_api_key_env(cfg, path)
+    if check_keys:
+        _validate_api_keys(cfg, path)
     return cfg
 
 
@@ -304,18 +315,76 @@ def _validate_thinking(cfg: ModelsConfig, path: Path) -> None:
         raise ConfigError(f"✗ 推理配置不自洽：{path.as_posix()}\n" + "\n".join(problems))
 
 
-def _validate_api_key_env(cfg: ModelsConfig, path: Path) -> None:
+def _validate_api_keys(cfg: ModelsConfig, path: Path) -> None:
+    """启动校验：每个 provider 至少要有一条可用的 key 来源，否则在联网前就退出。"""
     missing: list[str] = []
     for pname, provider in cfg.providers.items():
-        if not os.environ.get(provider.api_key_env):
+        if resolve_api_key(provider, required=False) is None:
+            hint_env = f"export {provider.api_key_env}=<你的 key>" if provider.api_key_env else ""
             missing.append(
-                f"  {pname}：环境变量 {provider.api_key_env} 未设置\n"
-                f"    请执行：export {provider.api_key_env}=<你的 key>"
+                f"  {pname}：既没在配置里写 api_key，环境变量"
+                f"{(' ' + provider.api_key_env) if provider.api_key_env else ''} 也未设置\n"
+                f"    方式一（环境变量，推荐）：{hint_env}\n"
+                f"    方式二（配置明文）：在 {path.as_posix()} 的 providers.{pname} 下加一行\n"
+                f"      api_key: <你的 key>          # 该文件已被 gitignore，请勿提交"
             )
     if missing:
         raise ConfigError(
-            f"✗ {path.as_posix()} 中以下 provider 的 api_key_env 未设置：\n" + "\n".join(missing)
+            f"✗ {path.as_posix()} 中以下 provider 没有可用的 API key：\n" + "\n".join(missing)
         )
+
+
+# ---------------------------------------------------------------------------
+# API key
+# ---------------------------------------------------------------------------
+
+
+def resolve_api_key(provider: ProviderConfig, required: bool = True) -> str | None:
+    """取出该 provider 的 API key：配置文件明文 > 环境变量。
+
+    明文用 :class:`SecretStr` 承载，异常信息里永远不回显 key 本身。
+    ``required=False`` 时取不到返回 ``None``，供启动校验使用。
+    """
+    if provider.api_key is not None:
+        plain = provider.api_key.get_secret_value().strip()
+        if plain:
+            return plain
+    if provider.api_key_env:
+        value = os.environ.get(provider.api_key_env, "").strip()
+        if value:
+            return value
+    if required:
+        raise ConfigError(
+            f"✗ provider 没有可用的 API key：请配置 api_key，或设置环境变量 {provider.api_key_env}"
+        )
+    return None
+
+
+def mask_key(key: str) -> str:
+    """脱敏展示：只留首尾各 4 位，短 key 全打星。用于启动日志。"""
+    if len(key) <= 8:
+        return "*" * len(key)
+    return f"{key[:4]}***{key[-4:]}"
+
+
+def api_key_report(cfg: ModelsConfig) -> list[str]:
+    """每个 provider 的 key 来源，脱敏后的一行说明。启动日志用，帮用户确认「到底用了哪个 key」。"""
+    lines: list[str] = []
+    for pname, provider in cfg.providers.items():
+        key = resolve_api_key(provider, required=False)
+        if key is None:
+            lines.append(f"  {pname}：✗ 无可用 key")
+        elif provider.api_key is not None and provider.api_key.get_secret_value().strip():
+            # 明文会盖掉环境变量，这里显式说明，免得用户以为 export 没生效
+            shadowed = (
+                "（环境变量已设置但被明文覆盖）"
+                if provider.api_key_env and os.environ.get(provider.api_key_env)
+                else ""
+            )
+            lines.append(f"  {pname}：配置文件明文 {mask_key(key)}{shadowed}")
+        else:
+            lines.append(f"  {pname}：环境变量 {provider.api_key_env} = {mask_key(key)}")
+    return lines
 
 
 # ---------------------------------------------------------------------------

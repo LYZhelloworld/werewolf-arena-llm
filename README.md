@@ -64,31 +64,36 @@ hunter:
 
 ## 快速开始
 
-> 项目尚在设计阶段，以下代码还跑不起来。这里展示的是目标形态。
-
 ```bash
 # 1. 从样例生成你自己的配置（真实配置不入库）
 cp configs/board.example.yaml  configs/board.yaml
 cp configs/game.example.yaml   configs/game.yaml
 cp configs/models.example.yaml configs/models.yaml
 
-# 2. 填入 API key 到环境变量（配置里只写环境变量名，不写明文）
-export DEEPSEEK_API_KEY=sk-xxx
-export OPENAI_API_KEY=sk-xxx
-
-# 3. 启动服务
-uv run python -m server.app
-
-# 4. 打开前端
-cd web && npm install && npm run dev
+# 2. 提供 API key，两种方式任选（优先级：配置明文 > 环境变量）
+export DEEPSEEK_API_KEY=sk-xxx        # 方式一：环境变量（推荐）
+# 方式二：在 configs/models.yaml 的 providers.deepseek 下写一行 api_key: sk-xxx
 ```
+
+两种方式都没有 → 启动报错并同时给出这两条修复命令。两者都写 → 以配置明文为准，
+启动日志会标注「（环境变量已设置但被明文覆盖）」，不会让你以为 export 没生效。
 
 配置缺失或非法时，程序会**打印明确的修复命令并异常退出**，不会静默用默认值糊弄过去。
 
-一行命令在终端里跑完一局（不需要前端）：
+**现在就能跑**（M2 阶段用随机策略替身，不需要 API key、不需要前端）：
 
 ```bash
-uv run python -m orchestrator.cli --preset mixed
+uv run python -m orchestrator.cli                    # 上帝视角看一局彩色日志
+uv run python -m orchestrator.cli --view 3           # 换成 3 号玩家的视角（看不到底牌与私有频道）
+uv run python -m orchestrator.cli --games 50 --summary   # 批量压规则，只看结果
+uv run python -m orchestrator.cli --delay 0.3        # 放慢节奏，一屏一屏地看
+```
+
+接入 LLM 后的目标形态（尚未实现）：
+
+```bash
+uv run python -m server.app          # 启动服务
+cd web && npm install && npm run dev # 打开前端
 ```
 
 ## 对局记录
@@ -135,7 +140,7 @@ Orchestrator（对局编排）
 
 - [x] M0 仓库骨架与配置样例
 - [x] M1 规则引擎（纯确定性 + 单测，含信息隔离测试）
-- [ ] M2 CLI 随机策略跑通整局
+- [x] M2 CLI 随机策略跑通整局（彩色输出 + 事件流落盘 JSON）
 - [ ] M3 接入 LLM、多轮工具循环、CoT 捕获
 - [ ] M4 记忆工具
 - [ ] M5 FastAPI + WebSocket 服务化

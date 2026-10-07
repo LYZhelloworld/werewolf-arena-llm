@@ -2,13 +2,18 @@
 #
 #   cp configs/models.example.yaml configs/models.yaml
 #
-# 只写环境变量「名」，绝不写明文 key。
+# API key 有两条来源，优先级：配置明文 api_key > 环境变量 api_key_env
+#   1) api_key_env: DEEPSEEK_API_KEY   —— 只写变量名，key 放环境变量（推荐）
+#   2) api_key: sk-xxxx                —— 直接写明文；本文件已被 gitignore，请勿提交
+# 两者都写时以明文为准（环境变量会被覆盖）。都没有则启动报错并给出修复命令。
+#
 # 配置优先级：defaults → provider 级 → model 级，后者覆盖前者，嵌套对象深合并。
 
 providers:
   deepseek:
     base_url: https://api.deepseek.com/v1
     api_key_env: DEEPSEEK_API_KEY
+    # api_key: sk-xxxx                 # 想用明文就取消这行注释（优先于上面的环境变量）
     thinking: { enabled: false }    # provider 级默认：非思考模型
     models:
       - name: deepseek-chat

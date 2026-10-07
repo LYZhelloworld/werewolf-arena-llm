@@ -9,6 +9,7 @@ import shutil
 from pathlib import Path
 
 import pytest
+from pydantic import SecretStr
 
 from config import (
     CONFIG_DIR,
@@ -16,9 +17,13 @@ from config import (
     ConfigError,
     GameConfig,
     ModelsConfig,
+    ProviderConfig,
+    api_key_report,
     load_board,
     load_game,
     load_models,
+    mask_key,
+    resolve_api_key,
     resolve_thinking,
 )
 
@@ -76,6 +81,123 @@ def test_missing_api_key_env_reports_export(
         load_models(prepared)
     assert "DEEPSEEK_API_KEY" in exc.value.message
     assert "export" in exc.value.message
+    # 报错要同时给出「写明文」这条路
+    assert "api_key" in exc.value.message
+
+
+# --- API key：明文优先于环境变量 -------------------------------------------
+
+
+def _write_models(tmp_path: Path, body: str) -> Path:
+    (tmp_path / "models.yaml").write_text(body, encoding="utf-8")
+    return tmp_path
+
+
+def test_plain_api_key_in_config_wins_over_env(tmp_path: Path) -> None:
+    cfg = load_models(
+        _write_models(
+            tmp_path,
+            "providers:\n"
+            "  x:\n"
+            "    base_url: http://localhost:11434/v1\n"
+            "    api_key_env: X_API_KEY\n"
+            "    api_key: sk-from-config\n"
+            "    models:\n"
+            "      - name: m\n",
+        ),
+    )
+    assert resolve_api_key(cfg.providers["x"]) == "sk-from-config"
+
+
+def test_env_key_is_used_when_no_plain_key(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("X_API_KEY", "sk-from-env")
+    cfg = load_models(
+        _write_models(
+            tmp_path,
+            "providers:\n"
+            "  x:\n"
+            "    base_url: http://localhost:11434/v1\n"
+            "    api_key_env: X_API_KEY\n"
+            "    models:\n"
+            "      - name: m\n",
+        )
+    )
+    assert resolve_api_key(cfg.providers["x"]) == "sk-from-env"
+
+
+def test_plain_key_alone_needs_no_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """只写明文、不设环境变量，也要能启动。"""
+    monkeypatch.delenv("X_API_KEY", raising=False)
+    cfg = load_models(
+        _write_models(
+            tmp_path,
+            "providers:\n"
+            "  x:\n"
+            "    base_url: http://localhost:11434/v1\n"
+            "    api_key: sk-from-config\n"
+            "    models:\n"
+            "      - name: m\n",
+        )
+    )
+    assert resolve_api_key(cfg.providers["x"]) == "sk-from-config"
+
+
+def test_no_key_source_at_all_fails_before_network(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("X_API_KEY", raising=False)
+    with pytest.raises(ConfigError) as exc:
+        load_models(
+            _write_models(
+                tmp_path,
+                "providers:\n"
+                "  x:\n"
+                "    base_url: http://localhost:11434/v1\n"
+                "    api_key_env: X_API_KEY\n"
+                "    models:\n"
+                "      - name: m\n",
+            )
+        )
+    message = exc.value.message
+    assert "export" in message and "api_key" in message
+    # 报错信息里绝不能回显任何 key
+    assert "sk-" not in message
+
+
+def test_error_message_never_echoes_key(tmp_path: Path) -> None:
+    """明文 key 不能出现在任何异常信息里。"""
+    provider = ProviderConfig(base_url="http://x/v1", api_key=SecretStr("sk-super-secret-value"))
+    # YAML 里写的裸字符串会被 Pydantic 自动转成 SecretStr
+    plain = ProviderConfig.model_validate(
+        {"base_url": "http://x/v1", "api_key": "sk-super-secret-value"}
+    )
+    assert resolve_api_key(plain) == "sk-super-secret-value"
+
+    with pytest.raises(ConfigError) as exc:
+        resolve_api_key(
+            ProviderConfig(base_url="http://x/v1", api_key_env="NO_SUCH_ENV", api_key=None)
+        )
+    assert "sk-" not in exc.value.message
+    # SecretStr 让 print / repr 也不泄漏
+    assert "sk-super-secret-value" not in repr(provider)
+    assert mask_key("sk-super-secret-value").startswith("sk-s")
+
+
+def test_api_key_report_masks_and_marks_source(tmp_path: Path) -> None:
+    cfg = load_models(
+        _write_models(
+            tmp_path,
+            "providers:\n"
+            "  x:\n"
+            "    base_url: http://localhost:11434/v1\n"
+            "    api_key_env: X_API_KEY\n"
+            "    api_key: sk-abcdefghijklmnop\n"
+            "    models:\n"
+            "      - name: m\n",
+        )
+    )
+    report = "\n".join(api_key_report(cfg))
+    assert "明文" in report and "sk-abcdefghijklmnop" not in report
 
 
 def test_invalid_replay_on_error_fails_before_network(tmp_path: Path) -> None:

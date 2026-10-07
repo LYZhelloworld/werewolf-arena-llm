@@ -47,6 +47,7 @@
 - 改动配置结构时，**同时改 `*.example.yaml`**，并在里面写清中文注释说明每个开关的含义。
 - 新增配置项必须：加到 example 文件 → 加到 Pydantic schema → 在 `engine/rules.py` 里加分支 → 补单测。
 - 程序启动时校验配置；缺失或非法要**打印可复制的修复命令并异常退出**，绝不静默回退到默认值。
+- API key 的两条来源（明文 / 环境变量）都在 `config.py` 里解析，别在 client 或编排层重复实现读取逻辑。
 
 ---
 
@@ -116,7 +117,9 @@
    「只在内存里」的实现不合格。
 
 8. **不得硬编码或提交任何 API key。**
-   只从环境变量读取，`configs/models.yaml` 里只存环境变量**名**。
+   key 有两条来源，优先级：**配置文件明文 `api_key` > 环境变量 `api_key_env`**（见 DESIGN.md §3.2）。
+   一律通过 `resolve_api_key(provider)` 取，不要在别处自己拼 `os.environ[...]`。
+   明文用 `SecretStr` 承载；异常信息、日志、事件流、`meta.json` 里**绝不出现完整 key**（日志用 `api_key_report()` 脱敏）。
    提交前检查 diff 里没有 `sk-` 开头的字符串。
 
 ---
@@ -174,9 +177,15 @@
 
 ```bash
 # 后端
-uv sync                    # 安装依赖
-uv run pytest              # 测试
-uv run python -m orchestrator.cli   # 终端跑一局
+uv sync                                        # 安装依赖
+uv run pytest                                  # 测试
+uv run ruff check . && uv run ruff format .    # lint 与格式化
+uv run mypy config.py engine orchestrator storage tests   # 类型检查
+
+# 终端跑一局（M2 起可用，随机策略，不需要 API key）
+uv run python -m orchestrator.cli
+uv run python -m orchestrator.cli --view 3         # 以 3 号视角观战（自检信息隔离）
+uv run python -m orchestrator.cli --games 50 --summary
 
 # 前端
 cd web && npm install && npm run dev
@@ -202,6 +211,9 @@ Python 用 **uv** 管理，Node 用 npm。不要用系统级 pip 全局装包。
   出局只是 `alive = false`，不是「删除 agent」。
 - 别把主动 `abstain()` 标成 `fallback: true`，那会把正常策略误报成故障。
 - 别让并发直接 `asyncio.gather` 全部 9 席，要走 `agent.max_concurrency` 信号量，否则容易被限流。
+- 别用 `json.dump` 直接覆盖 `events.json` / `meta.json` / `index.json`，一律走
+  `storage.atomic.atomic_write_json`——崩溃留下的半截 JSON 会毁掉整局复盘。
+- 别让落盘跟着观战视角走：`--view 3` 只影响屏幕，存档永远是全量事件流。
 - 改 event schema 时记得同步：前端类型生成、回放逻辑、DESIGN.md 的枚举表。
 - 多轮工具循环必须有 `max_tool_turns` 上限，否则模型可能死循环。
 

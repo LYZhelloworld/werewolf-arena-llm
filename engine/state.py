@@ -36,6 +36,15 @@ FACTION_OF: dict[Role, Faction] = {
 
 GOD_ROLES = {Role.SEER, Role.WITCH, Role.HUNTER}
 
+# 角色的中文名。枚举值本身保持英文（协议字段），展示层用这张表翻译。
+ROLE_LABELS: dict[Role, str] = {
+    Role.WEREWOLF: "狼人",
+    Role.SEER: "预言家",
+    Role.WITCH: "女巫",
+    Role.HUNTER: "猎人",
+    Role.VILLAGER: "平民",
+}
+
 
 class DeathCause(StrEnum):
     """死因。决定猎人能否开枪，也决定是否有遗言。"""
