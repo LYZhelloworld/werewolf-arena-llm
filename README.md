@@ -144,7 +144,7 @@ Orchestrator（对局编排）
 - [x] M3 接入 LLM、多轮工具循环、CoT 捕获
 - [x] M4 记忆工具（memory_write / memory_read，随 M3 提前实现）
 - [x] M5 FastAPI + WebSocket 服务化（REST 启动/回放 + WS 实时事件流）
-- [ ] M6 前端实时观战 + CoT 面板
+- [x] M6 前端观战（大厅 + 对局房间，实时观战 + CoT 面板）
 - [ ] M7 回放与视角切换
 - [ ] M8 遗言、赛后感想与打磨
 
