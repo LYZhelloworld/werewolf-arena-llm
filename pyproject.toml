@@ -1,0 +1,40 @@
+[project]
+name = "werewolf-arena-llm"
+version = "0.1.0"
+description = "让 9 个大语言模型坐在一桌打狼人杀，供人类实时观战"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "pydantic>=2.9",
+    "pyyaml>=6.0",
+]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.11",
+    "pytest>=8.0",
+    "ruff>=0.7",
+]
+
+# 本项目是应用而非可发布库：不把项目自身打成包安装，
+# 直接以仓库根目录作为导入根运行（engine/、agents/ 等顶层包）。
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["B008"]
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+warn_unused_configs = true

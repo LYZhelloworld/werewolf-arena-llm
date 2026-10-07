@@ -1,0 +1,65 @@
+# 板子配置样例 —— 复制到 configs/board.yaml 后修改（真实配置不入库）
+#
+#   cp configs/board.example.yaml configs/board.yaml
+#
+# 约定：按角色分组，尽量用 boolean，少用枚举。
+# 修改本文件的结构时，必须同步改 config.py 的 Pydantic schema 并补单测。
+
+roles:
+  werewolf: 3                       # 狼人数量
+  seer: 1                           # 预言家
+  witch: 1                          # 女巫
+  hunter: 1                         # 猎人
+  villager: 3                       # 平民
+
+witch:
+  has_antidote: true                # 拥有解药（开局一瓶）
+  has_poison: true                  # 拥有毒药（开局一瓶）
+  self_save: true                   # 可以救自己
+  self_save_first_night_only: true  # 自救仅限首夜（第 1 天夜）
+  self_poison: false                # 不可以毒死自己
+  knows_kill_target: true           # 每晚得知今夜刀口是谁
+  knows_poisoned_identity: false    # 毒人后是否得知对方身份
+  same_night_both_potions: false    # 同一晚不可同时使用解药和毒药
+
+hunter:
+  shoot_on_lynch: true              # 被投票出局时可以开枪
+  shoot_on_kill: true               # 被狼人刀死时可以开枪
+  shoot_on_poison: false            # 被女巫毒死时不能开枪
+  can_hold_fire: true               # 可以放弃开枪
+
+seer:
+  check_every_night: true           # 每晚可查验一人
+  reveal_faction_only: true         # 只告知「好人 / 狼人」，不告知具体角色
+  can_check_self: false             # 不可查验自己
+  can_check_dead: false             # 不可查验已出局者
+
+werewolf:
+  chat_rounds: 2                    # 夜间私有协商轮数（0 表示不协商直接出刀）
+  vote_kill: true                   # 出刀需全体狼人投票
+  tie_break_by_lowest_seat: true    # 出刀二次平票时，取平票候选中座位号最小者
+  can_kill_teammate: false          # 不可刀自己的狼队友
+  can_kill_self: false              # 不可刀自己
+
+death:
+  reveal_role: false                # 出局不翻牌（身份仅观众可见）
+  last_words_on_lynch: true         # 被票出局者有遗言
+  last_words_on_night_death: false  # 夜间死亡者无遗言
+  last_words_on_first_night: false  # 首夜死亡者无遗言
+
+vote:
+  runoff_on_tie: true               # 平票进入加时辩（平票者各发言一轮后重投）
+  no_lynch_on_second_tie: true      # 二次平票则本日无人出局
+  secret_ballot: true               # 同时投票，投票期间互不看见；false = 按座位依次公开投票
+  allow_abstain: true               # 允许弃权（弃权票不投给任何人）
+
+day:
+  discussion_rounds: 2              # 白天讨论轮数
+  speech_max_chars: 300             # 单条发言字数上限
+
+win:
+  eliminate_one_faction: true       # 屠边：神职全灭或平民全灭即狼人胜
+
+postgame:
+  enabled: true                     # 赛后感想环节
+  reveal_all_roles: true            # 感想前向全体揭示真实身份

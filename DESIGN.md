@@ -190,6 +190,11 @@ configs/*.yml
 配置键全部为 boolean，见 §4.8。默认：拥有解药与毒药各一瓶；首夜可自救、之后不可自救；
 不可自毒；每晚得知刀口；毒人后不知对方身份；同晚不可两药齐用。
 
+**解药的作用对象固定为「今夜刀口」**：女巫只能决定救或不救，**不能另选一个救人目标**。
+因此 `witch_save()` 无参数。`witch.self_save` / `self_save_first_night_only` 这两个开关
+**只在刀口恰好是女巫本人时才生效**（即「自救」场景）；刀口是别人时不受这两个开关限制。
+若今夜空刀（狼人未产出有效刀口），则解药无从使用，女巫本夜只能毒人或弃权。
+
 ### 4.6 猎人细则
 
 配置键全部为 boolean，见 §4.8。默认：被女巫毒死时不能开枪；其余死亡方式可开枪；可放弃开枪。
@@ -199,7 +204,7 @@ configs/*.yml
 | 场景 | 规则 |
 | --- | --- |
 | 白天投票平票 | 平票者各发言一轮（加时辩）→ 全体在平票者中重新投票 → 若二次平票，则**本日无人出局**，直接进入夜晚。 |
-| 狼人出刀平票 | 平票狼各发言一轮 → 重新投票 → 二次平票则由**座位号最小**的狼决定刀口（确定性兜底）。 |
+| 狼人出刀平票 | **全体存活狼人**再发言一轮 → 重新投票（候选项限定为平票目标）→ 二次平票则取**平票候选中座位号最小者**（确定性兜底，不再追加第三轮）。 |
 
 ### 4.8 板子配置（按角色分组，尽量 boolean）
 
@@ -276,6 +281,55 @@ postgame:
 
 ---
 
+### 4.10 阶段枚举（Phase）
+
+引擎的状态机阶段，英文枚举值（`event.phase` 字段直接用它）：
+
+```
+night_wolf_chat           夜间·狼人私有协商
+night_wolf_vote           夜间·狼人出刀投票
+night_wolf_runoff_speech  夜间·出刀平票后的加时协商
+night_wolf_runoff_vote    夜间·出刀平票后的重投
+night_seer                夜间·预言家查验
+night_witch               夜间·女巫用药
+night_resolve             夜间·结算（无人行动，引擎自动推进）
+night_hunter_shoot        夜间·猎人死亡触发开枪
+day_announce              白天·昨夜死亡公告（无人行动）
+day_discussion            白天·自由讨论
+day_vote                  白天·投票
+day_runoff_speech         白天·平票者加时辩
+day_runoff_vote           白天·平票重投
+day_resolve               白天·出局结算（无人行动）
+last_words                遗言
+hunter_shoot              白天·猎人开枪
+postgame                  赛后感想
+game_over                 终局
+```
+
+补充说明：
+- **猎人夜间死亡时在夜间就触发开枪**（`night_hunter_shoot`），结果计入当夜死亡名单，随
+  `day_announce` 一起公布。这与 §4.3 步骤 5「夜间结算触发猎人技能」一致。
+- 需要 LLM 行动才推进的阶段，由 Orchestrator 向 `legal_actions()` 列出的席位索要动作；
+  **无人行动的阶段**（`night_resolve` / `day_announce` / `day_resolve`）由引擎自动结算推进。
+
+### 4.11 投票事件的可见性
+
+为保证「投票期间互不看见」（§4.4），投票事件分两段：
+
+| 事件 | 时机 | 可见性 |
+| --- | --- | --- |
+| `vote_cast` / `vote_abstain` | 逐个提交时 | **spectator**——仅观众可见，任何 agent 都看不到 |
+| `vote_result` | 全部收齐、计票完成后 | 白天投票 = `public`；狼人出刀 = `private:wolf` |
+
+即：**agent 永远只能看到「计完票的结果」，看不到「谁投了谁」的中间过程**。
+观众能看到全部细节（这也正是观战的价值）。
+
+同理，夜间死亡在 `night_resolve` 时以 **spectator** 可见性写入 `death` 事件
+（夜里没人该知道），到 `day_announce` 才以 `public` 的 `night_deaths_announced` 公布名单，
+且不公布死因。白天被票出局 / 被猎人开枪的 `death` 则直接是 `public`。
+
+---
+
 ## 5. 总体架构
 
 ### 5.1 分层
@@ -334,12 +388,12 @@ postgame:
 
 ```python
 class Visibility(str, Enum):
-    PUBLIC      = "public"        # 所有人可见（发言、投票、遗言、感想、死亡公告）
-    WOLF        = "private:wolf"  # 仅狼人可见（夜间协商）
-    SEER        = "private:seer"  # 仅预言家可见（查验结果）
-    WITCH       = "private:witch" # 仅女巫可见（刀口信息）
-    SELF        = "private:self"  # 仅行动者本人可见（记忆读写）
-    SPECTATOR   = "spectator"     # 仅观众可见（真实身份底牌、**全部 CoT**）
+    PUBLIC = "public"  # 所有人可见（发言、投票、遗言、感想、死亡公告）
+    WOLF = "private:wolf"  # 仅狼人可见（夜间协商）
+    SEER = "private:seer"  # 仅预言家可见（查验结果）
+    WITCH = "private:witch"  # 仅女巫可见（刀口信息）
+    SELF = "private:self"  # 仅行动者本人可见（记忆读写）
+    SPECTATOR = "spectator"  # 仅观众可见（真实身份底牌、**全部 CoT**）
 ```
 
 ### 6.2 CoT（思考过程）的隔离规则
@@ -776,6 +830,7 @@ wolf_kill / hunter_shoot / hunter_hold
 memory_write / memory_read
 death / night_deaths_announced
 action_rejected / action_fallback
+roles_revealed                # 赛后感想前向全体揭示真实身份（public）
 game_over / game_aborted
 ```
 
@@ -885,12 +940,15 @@ werewolf-arena-llm/
 │   ├── game.example.yaml        # 对局参数（提交）
 │   └── models.example.yaml      # provider 与模型（提交）
 │   # board.yaml / game.yaml / models.yaml 由用户复制生成，不提交
+├── config.py                    # Pydantic 配置 schema + 加载与启动校验
 ├── engine/                      # 规则引擎（纯确定性，无 I/O）
-│   ├── state.py                 # GameState / Player / Phase
-│   ├── rules.py                 # 板子配置校验与规则分支
+│   ├── state.py                 # GameState / Player / Phase / NightState
+│   ├── actions.py               # Action / ActionType / LegalAction
+│   ├── events.py                # Event / Visibility / Thinking / RenderText
+│   ├── rules.py                 # 合法性与目标计算、胜负判定
 │   ├── engine.py                # RuleEngine: apply(state, action) -> (state, events)
 │   ├── visibility.py            # view_for(state, seat)
-│   ├── phases.py                # 阶段状态机
+│   ├── phases.py                # 阶段状态机（setup / resolve）
 │   └── prompts/                 # 各角色中文 prompt 模板
 ├── agents/                      # LLM 运行时
 │   ├── runtime.py               # OpenAI 兼容客户端 + 并发
@@ -968,4 +1026,5 @@ werewolf-arena-llm/
 | 2026-10-07 | v0.2 | 依据用户反馈修订，共 8 项：<br>1. **语言**：文档 / 注释 / LLM 提示词 / user 消息 / UI 文案 / 事件人工可读文本统一简体中文；代码标识符与协议枚举值（event `type`、`visibility`、tool 名、配置 key）保持英文（跨语言映射与 TS 类型生成需要）。<br>2. **配置**：仓库只提交 `*.example.yaml`，真实配置 gitignore；启动时校验，缺失则打印可复制的修复命令并异常退出。<br>3. **记忆工具**：新增 `memory_write` / `memory_read` 两个始终可用的辅助工具，私有（`private:self`），仅存在于上下文与持久化复盘记录中；工具协议改为多轮 ReAct 循环（不再用 `tool_choice=required`），配 `max_tool_turns` 上限。<br>4. **CoT**：观众可见、本人可见、**其他任何 agent 绝对不可见**；`thinking` 恒为 spectator 级并写入事件流；多源捕获（原生 reasoning 字段 → `content` → 可选 `think` 工具），best-effort。<br>5. **持久化**：移除 SQLite，全 JSON。进行中写 `events.jsonl`（崩溃安全），结束时归档 `events.json`；索引 `index.json`；可选 `contexts/{seat}.json` 完整消息快照。明确「思考 / 发言 / 决策 / 记忆 / 感想 / 被拒动作 / 兜底」全部落盘。<br>6. **seed**：改为可选，不承诺可复现；RNG 仍由引擎注入以便调试。<br>7. **规则补充**：新增遗言环节（默认仅被票出局者有）与赛后感想环节（全体 9 人逐一发表，前向全体揭示真实身份）；确认出局不翻牌；白天讨论 2 轮、狼人协商 2 轮。<br>8. **配置风格**：板子配置改为按角色分组的 boolean 风格（`witch.self_save` / `witch.self_save_first_night_only` / `hunter.shot_on_poison` 等），替换原枚举式写法；明确不做战绩统计与多局同屏对比。<br>注：用户示例中的 `hunter.shot_on_position` 应为 `hunter.shot_on_poison`（毒药），已按后者写入。 |
 | 2026-10-07 | v0.3 | 明确并细化 CoT 处理，另确认遗言规则：<br>1. **遗言**：确认**夜间死者没有遗言**。仅被票出局者有遗言；`death.last_words_on_night_death` 与 `last_words_on_first_night` 默认 false（配置项保留以便实验）。开放问题中该项已关闭。<br>2. **CoT 拆成三件独立的事**：捕获（capture）/ 回传（replay）/ 记录（persist）。**记录永远无条件全量做**；回传按 provider 协议走。<br>3. **回传策略 `thinking.replay`**：`auto`（默认，原样保留，遇 400 自动剥离重试并降级）/ `required`（必须回传，不降级，用于 Kimi k2.7-code、Qwen qwen3.8-max 等硬性要求）/ `ignored`（不回传但照常记录）/ `forbidden`（必须剥离，用于旧版 deepseek-reasoner 这类回传即 400 的）。<br>4. **协议差异已核实**：DeepSeek 思考模式带 `tools` 时必须回传、不带时被忽略；旧版 `deepseek-reasoner` 回传即 400；Kimi `k2.7-code` 保留式思考强制开启必须回传；Qwen `qwen3.8-max`/`qwen3.8-flash` 的 `preserve_thinking` 默认 true 必须完整回传；OpenAI o 系列不返回推理内容。<br>5. **硬性约束**：回传必须放在 assistant 消息的 `reasoning_content` 字段，**绝不能拼进 `content`**（Qwen 官方明示会掉效果）；只能回传自己的 CoT；回传计入 input token 并计费。<br>6. **新增 `extra_body` 配置**：承载各家非 OpenAI 标准的开关（`thinking.keep` / `preserve_thinking` / `enable_thinking` / `thinking_budget`）。<br>7. **成本控制**：新增 `thinking.replay_window`（默认 null = 全量回传）；持久化始终全量，与回传解耦。<br>8. **事件 schema 调整**：`thinking` 由字符串改为对象 `{text, source, replayed}`；`source` 取值 `reasoning_content` \| `content` \| `think_tool` \| `none`。<br>9. 风险表新增 R8（回传规则冲突）、R9（回传成本与上下文膨胀），原 R8 顺延为 R10。 |
 | 2026-10-07 | v0.4 | 参考 OpenCode 与 DeepSeek Harness 重构 CoT 兼容层（§7.1、§7.4）：<br>1. **引入 Provider Adapter 边界**（§7.1）：内部表示归一化，出口按配置序列化；新增设计原则「provider 差异只存在于配置里，代码里不出现 `if provider == "..."`」。<br>2. **配置三层优先级**：`defaults` → provider 级 → model 级，后者覆盖前者、嵌套深合并（同 OpenCode 的 provider → model → variant）。<br>3. **字段名改为可配字符串**：新增 `thinking.field`（`auto` 按 `reasoning_content` → `reasoning` → `reasoning_text` 探测，或显式指定任意 provider 私有字段名）——对应 OpenCode 的 `compatibility.reasoningField`。<br>4. **`replay` 由四值枚举收敛为 boolean**：原 `auto\|required\|ignored\|forbidden` 中 `auto` 与 `required` 实现上无法区分、`ignored` 与 `enabled: false` 语义重叠，改为 `replay: true\|false`。<br>5. **新增启动校验**（§7.4.3）：对齐 DeepSeek Harness 的 `UNSUPPORTED_REASONING_EFFORT`——非法推理配置在**发起任何网络 I/O 之前**失败，不等跑到中途才炸。运行时降级保留为第二层（`replay_on_error: fallback\|fail`）。<br>6. **新增 §7.4.4**：不在代码里按 provider 名字 if-else；唯一例外是按模型名模式匹配做兜底（OpenCode 的 `isKimiFamily()` 同理），且仅当配置未显式指定时生效。<br>7. **新增 §7.4.1 附注**：OpenAI o 系列可用 Responses API 的 `reasoning.encrypted_content` 不透明 blob 回传推理状态（OpenCode 做法），明文拿不到但连贯性可保。<br>8. **新增 §7.4.6**：OpenCode / DeepSeek Harness / 本项目三方做法对照表。顺带印证了两处既有选择——回传必须走独立字段而非拼进 `content`；「模型能看到的一切都记进 append-only 日志」（DSH 的 Trajectory 逐来源回看 ↔ 本项目的 `contexts/{seat}.json`）。 |
+| 2026-10-07 | v0.6 | M1 规则引擎开工前补齐的规则空白与前两版的措辞歧义：<br>1. **女巫解药语义明确**（§4.5）：解药作用对象**固定为「今夜刀口」**，女巫只决定救或不救，**不能另选救人目标**，故 `witch_save()` 无参数。`self_save` / `self_save_first_night_only` **仅在刀口恰好是女巫本人时生效**；刀口是别人时不受限。今夜空刀则解药无从使用。<br>2. **狼人出刀平票规则明确**（§4.7）：原措辞「平票狼各发言一轮 / 座位号最小的狼决定刀口」含糊且需要额外一轮动作，现明确为——**全体存活狼人**再发言一轮 → 重投（候选项限定为平票目标）→ 二次平票取**平票候选中座位号最小者**（确定性兜底，不追加第三轮）。<br>3. **新增 §4.10 阶段枚举**：列出全部 18 个 Phase 的英文值。明确**猎人夜间死亡在夜间就触发开枪**（`night_hunter_shoot`），结果计入当夜死亡名单随 `day_announce` 公布——与 §4.3 步骤 5 一致。区分「需 LLM 行动的阶段」与「引擎自动结算推进的阶段」（`night_resolve` / `day_announce` / `day_resolve`）。<br>4. **新增 §4.11 投票事件可见性**：为落实「投票期间互不看见」，`vote_cast` / `vote_abstain` 在逐个提交时 **visibility = spectator**（任何 agent 都看不到），计票完成后才发 `vote_result`（白天 public / 狼人出刀 private:wolf）。即 agent 只能看到计完票的结果，看不到谁投了谁。同理夜间 `death` 事件为 spectator，到 `day_announce` 才以 public 的 `night_deaths_announced` 公布名单且不公布死因；白天被票/被枪的 `death` 直接 public。<br>5. **新增 event type `roles_revealed`**（§8.3）：赛后感想前向全体揭示真实身份，public。<br>6. **目录结构调整**（§11）：新增根级 `config.py`（Pydantic schema + 加载与启动校验）、`engine/actions.py`、`engine/events.py`，把状态/动作/事件三类模型拆开，避免 `state.py` 过度膨胀。 |
 | 2026-10-07 | v0.5 | 收口设计阶段剩余未决项，另修两处文档内部矛盾：<br>1. **白天投票形式定为「同时投票、互不看见」**（§4.4）：投票期间谁也看不到别人的选择，全部提交后一次性公开；可并发，单日耗时明显短于串行。`vote.secret_ballot: false` 可切为按座位依次公开投票（必须串行），保留配置以备实验。狼人出刀同为同时投票。<br>2. **新增 §6.5「已出局玩家的信息流」**：定为**出局后继续旁观后续全部公开信息**，私有频道永久关闭（狼人出局后也不再看狼队协商）。这样赛后感想阶段出局者手里有完整公开叙事 + 自己的私有记忆 + 揭示的真实身份，感想才有内容可谈；若「出局即冻结」则感想会明显干瘪。实现上出局只置 `Player.alive = false`，不把 agent 从调度表摘除——出局者被动接收 public 事件、不产出动作（遗言与赛后感想除外）。<br>3. **存档根目录定为 `data/games/{game_id}/`**（§8.1）：gitignore 一条 `data/` 覆盖全部运行产物，未来加 logs/exports 不必再补规则，根目录不被污染。<br>4. **新增 §7.7 并发与限流**：同时投票意味着最坏 9 席并发，故加全局信号量 `agent.max_concurrency`（默认 4）与可选的 provider 级 `max_concurrency`；明确「白天讨论串行、投票/出刀/感想可并发」；429 走 `network_retries` 退避，耗尽走兜底。<br>5. **弃权改为显式合法动作**：新增 `abstain()` 工具（`vote.allow_abstain` 控制是否暴露），用于区分「模型主动弃权」（正常策略）与「模型卡住被兜底」（须打 `fallback: true`）。event type 新增 `vote_abstain`。<br>6. **补合法性约束配置**：`seer.can_check_self` / `seer.can_check_dead` / `werewolf.can_kill_teammate` / `werewolf.can_kill_self`（默认均 false），此前设计未写，引擎实现时会无从判断。<br>7. **修正两处文档内部矛盾**：§6.2 残留引用了 v0.3 已删除的 `thinking.include_own_in_context`（统一指向 `thinking.replay`）；板子配置中 `hunter.shot_on_poison` 与同组 `shoot_on_lynch` / `shoot_on_kill` 命名不一致，统一为 `shoot_on_poison`。<br>8. **§13 开放问题拆为「仍待定」与「已定（不再讨论）」两张表**，把历次已拍板的结论集中归档，避免重复讨论。 |

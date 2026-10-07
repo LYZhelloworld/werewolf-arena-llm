@@ -1,0 +1,70 @@
+# Provider 与模型配置样例 —— 复制到 configs/models.yaml 后修改（真实配置不入库）
+#
+#   cp configs/models.example.yaml configs/models.yaml
+#
+# 只写环境变量「名」，绝不写明文 key。
+# 配置优先级：defaults → provider 级 → model 级，后者覆盖前者，嵌套对象深合并。
+
+providers:
+  deepseek:
+    base_url: https://api.deepseek.com/v1
+    api_key_env: DEEPSEEK_API_KEY
+    thinking: { enabled: false }    # provider 级默认：非思考模型
+    models:
+      - name: deepseek-chat
+      - name: deepseek-reasoner
+        # 官方：请求带 tools 时，历史各轮 reasoning_content 应回传
+        thinking: { enabled: true, replay: true }
+
+  moonshot:
+    base_url: https://api.moonshot.cn/v1
+    api_key_env: MOONSHOT_API_KEY
+    models:
+      - name: kimi-k2.7-code
+        # 官方：保留式思考始终开启、无法关闭，必须原样保留
+        thinking:
+          enabled: true
+          replay: true
+          extra_body: { thinking: { type: enabled, keep: all } }
+      - name: kimi-k2.6
+        thinking:
+          enabled: true
+          replay: true
+          extra_body: { thinking: { type: enabled, keep: all } }
+
+  qwen:
+    base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+    api_key_env: DASHSCOPE_API_KEY
+    models:
+      - name: qwen3.8-max
+        # 官方：preserve_thinking 默认 true，必须完整回传
+        thinking:
+          enabled: true
+          replay: true
+          extra_body: { preserve_thinking: true }
+
+  openai:
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    models:
+      - name: gpt-4o-mini
+
+  local:
+    base_url: http://localhost:11434/v1      # Ollama
+    api_key_env: LOCAL_API_KEY
+    max_concurrency: 2                       # 本地显卡扛不住太高并发
+    models:
+      - name: qwen2.5:14b
+
+defaults:
+  temperature: 0.8
+  max_tokens: 1024                  # 需容纳「思考 + 工具调用」
+  timeout_s: 60
+  network_retries: 3
+  thinking:
+    enabled: false
+    # 读写 CoT 的字段名。auto 按 reasoning_content → reasoning → reasoning_text 探测；
+    # 也可直接写任意 provider 私有字段名。
+    field: auto
+    replay: true                    # 有 CoT 时是否原样回传给模型
+    replay_on_error: fallback       # 回传被拒时：fallback（剥离重试）| fail（报错）
