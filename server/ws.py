@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import json
 import queue
 import threading
 from datetime import UTC, datetime
@@ -32,6 +33,7 @@ from engine.state import Role
 from engine.visibility import ViewFilter
 from orchestrator.game_loop import GameRunner
 from orchestrator.policies import FirstLegalPolicy
+from server.schemas import GameListItem, GameMeta
 from storage.event_log import EVENTS_JSON, EventLog
 from storage.index import load_index, update_index
 from storage.meta import build_meta
@@ -209,24 +211,26 @@ class GameManager:
     # 回放读取
     # ------------------------------------------------------------------
 
-    def list_games(self) -> list[dict]:
+    def list_games(self) -> list[GameListItem]:
         """历史列表（含进行中的）。index.json 优先，再补上内存里还在跑的。"""
-        items = {item["game_id"]: item for item in load_index(self.root)}
+        items: dict[str, GameListItem] = {
+            item["game_id"]: GameListItem.model_validate(item) for item in load_index(self.root)
+        }
         for handle in self.games.values():
             if handle.game_id in items:
                 continue
-            items[handle.game_id] = {
-                "game_id": handle.game_id,
-                "started_at": handle.started_at.isoformat(),
-                "seed": handle.seed,
-                "models": handle.models_map,
-                "winner": None,
-                "days": None,
-                "event_count": len(handle.events),
-                "path": f"games/{handle.game_id}",
-                "running": True,
-            }
-        return sorted(items.values(), key=lambda item: str(item.get("started_at", "")))
+            with handle.lock:
+                event_count = len(handle.events)
+            items[handle.game_id] = GameListItem(
+                game_id=handle.game_id,
+                started_at=handle.started_at.isoformat(),
+                seed=handle.seed,
+                models=handle.models_map,
+                event_count=event_count,
+                path=f"games/{handle.game_id}",
+                running=True,
+            )
+        return sorted(items.values(), key=lambda item: item.started_at)
 
     def events_for(self, game_id: str, seat: int | None = None) -> list[Event] | None:
         """该局全部事件。还在跑就读内存；已结束从落盘的 events.json 读。
@@ -253,24 +257,22 @@ class GameManager:
             events = ViewFilter(seat, role).apply(events)
         return events
 
-    def meta_for(self, game_id: str) -> dict | None:
-        handle = self.games.get(game_id)
+    def meta_for(self, game_id: str) -> GameMeta | None:
         path = self.root / "games" / game_id / "meta.json"
         if path.exists():
-            import json
-
-            return json.loads(path.read_text(encoding="utf-8"))
+            return GameMeta.model_validate(json.loads(path.read_text(encoding="utf-8")))
+        handle = self.games.get(game_id)
         if handle is not None:
-            return {
-                "game_id": handle.game_id,
-                "started_at": handle.started_at.isoformat(),
-                "seed": handle.seed,
-                "models": handle.models_map,
-                "winner": None,
-                "days": None,
-                "running": True,
-                "event_count": len(handle.events),
-            }
+            with handle.lock:
+                event_count = len(handle.events)
+            return GameMeta(
+                game_id=handle.game_id,
+                started_at=handle.started_at.isoformat(),
+                seed=handle.seed,
+                models=handle.models_map,
+                running=True,
+                event_count=event_count,
+            )
         return None
 
 
@@ -279,7 +281,5 @@ def _load_archived(root: str | Path, game_id: str) -> list[Event] | None:
     path = Path(root) / "games" / game_id / EVENTS_JSON
     if not path.exists():
         return None
-    import json
-
     raw = json.loads(path.read_text(encoding="utf-8"))
     return [Event.model_validate(item) for item in raw]

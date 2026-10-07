@@ -1,6 +1,6 @@
 import { useState } from "react";
 import type { Event } from "../api/types";
-import { VIS_INFO, phaseLabel } from "../lib/derive";
+import { ALERT_TYPES, VIS_INFO, phaseLabel } from "../lib/derive";
 
 function CoT({ thinking }: { thinking: NonNullable<Event["thinking"]> }) {
   const [open, setOpen] = useState(false);
@@ -26,12 +26,17 @@ function CoT({ thinking }: { thinking: NonNullable<Event["thinking"]> }) {
 
 function EventItem({ e, godView }: { e: Event; godView: boolean }) {
   const vis = VIS_INFO[e.visibility] ?? VIS_INFO.public;
+  const alert = ALERT_TYPES[e.type];
+  const rowCls = alert ? alert.row : `${vis.border} bg-slate-800/60`;
   return (
-    <div className={`rounded border-l-4 ${vis.border} bg-slate-800/60 p-2`}>
+    <div className={`rounded border-l-4 ${rowCls} p-2`}>
       <div className="flex flex-wrap items-center gap-2 text-[11px] text-slate-400">
         <span>#{e.seq}</span>
         {e.actor != null && <span className="text-slate-300">{e.actor} 号</span>}
         <span className={`rounded px-1 py-0.5 text-white ${vis.badge}`}>{vis.label}</span>
+        {alert && (
+          <span className={`rounded px-1 py-0.5 text-white ${alert.badge}`}>{alert.label}</span>
+        )}
         <span className="text-slate-500">{e.type}</span>
       </div>
       <div className="mt-1 text-sm text-slate-100">
@@ -43,6 +48,9 @@ function EventItem({ e, godView }: { e: Event; godView: boolean }) {
           {e.llm.model} · {e.llm.latency_ms}ms · tok{" "}
           {(e.llm.prompt_tokens ?? 0) + (e.llm.completion_tokens ?? 0)}
           {e.llm.fallback && <span className="text-amber-400"> · 兜底</span>}
+          {e.llm.network_retries > 0 && (
+            <span className="text-orange-400"> · 重试{e.llm.network_retries}</span>
+          )}
           {e.llm.tool_turns > 0 && <span> · 工具{e.llm.tool_turns}轮</span>}
         </div>
       )}

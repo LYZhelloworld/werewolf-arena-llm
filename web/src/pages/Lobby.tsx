@@ -92,7 +92,12 @@ export default function Lobby({ onEnter }: { onEnter: (gameId: string) => void }
           </button>
         </div>
 
-        {error && <p className="mt-3 text-xs text-rose-400">{error}</p>}
+        {error && (
+          <div className="mt-3 rounded-lg border border-rose-700 bg-rose-950/50 px-3 py-2 text-xs text-rose-200">
+            <span className="font-medium">启动失败：</span>
+            {error}
+          </div>
+        )}
       </section>
 
       <section className="mt-6">

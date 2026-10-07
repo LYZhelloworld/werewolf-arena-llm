@@ -8,10 +8,12 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
-from agents.client import ChatRequest, LLMError, LLMResponse, ToolCall
+from agents.client import ChatRequest, LLMError, LLMResponse, OpenAICompatClient, ToolCall
 from agents.context import AgentContext
 from agents.loop import TurnParams, run_turn
 from agents.mock import MockClient, auto_responder, tool_call
@@ -21,6 +23,7 @@ from agents.tools import build_tools, call_to_action
 from config import AgentMemoryConfig, BoardConfig, GameConfig, ModelsConfig, ThinkingConfig
 from engine.actions import Action, ActionType, LegalAction
 from engine.engine import RuleEngine
+from engine.events import Event, Visibility
 from engine.state import GameState, Player, Role
 from orchestrator.game_loop import GameRunner
 
@@ -44,6 +47,7 @@ def make_ctx(
     *,
     thinking: ThinkingConfig | None = None,
     memory: AgentMemoryConfig | None = None,
+    max_public_events: int = 60,
 ) -> AgentContext:
     state = state or make_state()
     return AgentContext(
@@ -53,6 +57,7 @@ def make_ctx(
         thinking=thinking or ThinkingConfig(),
         memory=memory or AgentMemoryConfig(),
         model="mock",
+        max_public_events=max_public_events,
     )
 
 
@@ -487,8 +492,10 @@ def test_fallback_decision_is_marked_and_recorded() -> None:
     decision = policy.decide_all(make_state(), legal)[0]
     assert decision.llm is not None and decision.llm.fallback is True
     assert decision.action.target == 2  # 确定性兜底取最小座位号
-    assert [e.type for e in decision.side_events] == ["action_fallback"]
-    assert decision.side_events[0].payload["reason"]
+    types = [e.type for e in decision.side_events]
+    assert types[-1] == "action_fallback"
+    assert types.count("action_rejected") == 4  # 4 次非法动作各留一条痕
+    assert decision.side_events[-1].payload["reason"]
 
 
 def test_specs_from_models_resolves_provider_and_thinking() -> None:
@@ -544,3 +551,200 @@ def test_mock_client_records_requests_for_isolation_assertions() -> None:
     run(client, ctx, make_state(), [LegalAction(seat=1, type=ActionType.SPEAK)])
     assert client.call_count == 1
     assert "speak" in client.tool_names()
+
+
+# --- 上下文压缩（M8） -------------------------------------------------------
+
+
+def _event(
+    seq: int, type_: str, *, day: int = 1, actor: int | None = None, **payload: object
+) -> Event:
+    return Event(
+        seq=seq,
+        game_id="t",
+        day=day,
+        phase="day_discussion",
+        type=type_,
+        visibility=Visibility.PUBLIC,
+        actor=actor,
+        payload=payload,
+    )
+
+
+def _retained_lines(ctx: AgentContext) -> int:
+    """统计仍留在历史里的「自上次行动以来」事件行数。"""
+    total = 0
+    for message in ctx.snapshot():
+        content = message.get("content") or ""
+        marker = "自上次行动以来：\n"
+        if marker not in content:
+            continue
+        block = content.split(marker, 1)[1].split("\n\n", 1)[0]
+        total += len([line for line in block.split("\n") if line])
+    return total
+
+
+def test_public_history_window_drops_oldest_and_keeps_digest() -> None:
+    """超出窗口时：最早回合的事件文本被丢弃，死亡公告与首句进入「前情提要」。"""
+    state = make_state()
+    ctx = make_ctx(max_public_events=3)
+
+    ctx.observe(
+        [
+            _event(1, "speech", actor=2, message="我是第一个发言的"),
+            _event(2, "speech", actor=3, message="我是第二个发言的"),
+            _event(3, "death", seat=3),
+        ],
+        state,
+    )
+    ctx.begin_turn(state, [2, 3])
+
+    ctx.observe(
+        [
+            _event(4, "speech", actor=2, message="第二轮讨论来了"),
+            _event(5, "speech", actor=1, message="我也说两句"),
+        ],
+        state,
+    )
+    ctx.begin_turn(state, [2])
+
+    blob = json.dumps(ctx.snapshot(), ensure_ascii=False)
+    assert "我是第二个发言的" not in blob  # 非摘要事件被彻底丢弃
+    assert "前情提要" in blob  # 插入了模板摘要
+    assert "3 号出局" in blob  # 死亡公告进摘要
+    assert "我是第一个发言的" in blob  # 每轮首句进摘要
+    assert "我也说两句" in blob  # 最新回合完整保留
+    assert ctx.messages[0]["role"] == "system"
+    assert "前情提要" in ctx.messages[1]["content"]  # 摘要紧跟 system
+
+
+def test_public_history_stays_within_window() -> None:
+    """无论跑多少回合，保留的公开事件行数都不超过 max_public_events。"""
+    state = make_state()
+    ctx = make_ctx(max_public_events=4)
+    for i in range(10):
+        ctx.observe([_event(100 + i, "speech", actor=2, message=f"发言{i}")], state)
+        ctx.begin_turn(state, [2])
+    assert 1 <= _retained_lines(ctx) <= 4
+
+
+def test_public_history_window_disabled_when_non_positive() -> None:
+    """max_public_events <= 0 表示不压缩，全部保留。"""
+    state = make_state()
+    ctx = make_ctx(max_public_events=0)
+    for i in range(5):
+        ctx.observe([_event(200 + i, "speech", actor=2, message=f"第{i}条")], state)
+        ctx.begin_turn(state, [2])
+    blob = json.dumps(ctx.snapshot(), ensure_ascii=False)
+    assert "前情提要" not in blob
+    for i in range(5):
+        assert f"第{i}条" in blob
+
+
+# --- 异常提示信号（M8） -----------------------------------------------------
+
+
+def test_replay_downgrade_is_emitted_as_event() -> None:
+    """CoT 回传被拒 → 剥离重试，并在事件里留一条 llm_downgrade（观众可见）。"""
+    legal = [LegalAction(seat=1, type=ActionType.VOTE, allowed_targets=[2, 3])]
+    seen = {"n": 0}
+
+    def responder(_request: ChatRequest, _index: int) -> LLMResponse:
+        seen["n"] += 1
+        if seen["n"] == 1:
+            raise LLMError("Error code: 400 - reasoning_content is not allowed", status_code=400)
+        return tool_call("vote", seat=2)
+
+    ctx = make_ctx(thinking=ThinkingConfig(enabled=True, replay=True))
+    outcome = run(MockClient(responder), ctx, make_state(), legal)
+
+    assert outcome.action is not None
+    assert [e.type for e in outcome.pending_events] == ["llm_downgrade"]
+    assert outcome.pending_events[0].visibility == Visibility.SPECTATOR
+    assert ctx.thinking.replay is False  # 本 agent 的 replay 被降级
+
+
+class _Boom(Exception):
+    def __init__(self, status: int) -> None:
+        super().__init__("boom")
+        self.status_code = status
+
+
+def _fake_sdk_response() -> SimpleNamespace:
+    message = SimpleNamespace(
+        content="hi",
+        tool_calls=None,
+        model_dump=lambda **_: {"role": "assistant", "content": "hi"},
+    )
+    return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=None)
+
+
+def test_network_retries_are_counted(monkeypatch: pytest.MonkeyPatch) -> None:
+    """客户端自管重试：可重试错误重试后成功，并把次数记进响应（DESIGN §7.7）。"""
+    monkeypatch.setattr("agents.client._backoff_seconds", lambda _n: 0.0)
+    client = OpenAICompatClient(base_url="http://x", api_key="k", network_retries=3)
+
+    class _Flaky:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        async def create(self, **_kwargs: Any) -> Any:
+            self.attempts += 1
+            if self.attempts < 3:
+                raise _Boom(429)
+            return _fake_sdk_response()
+
+    flaky = _Flaky()
+    client._client = SimpleNamespace(  # type: ignore[assignment]
+        chat=SimpleNamespace(completions=SimpleNamespace(create=flaky.create))
+    )
+    response = asyncio.run(client.achat(ChatRequest(model="m", messages=[])))
+    assert response.network_retries == 2
+    assert flaky.attempts == 3
+
+
+def test_non_retryable_error_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    """400 这类客户端错误不重试，直接抛出（避免把非法请求重发一遍）。"""
+    monkeypatch.setattr("agents.client._backoff_seconds", lambda _n: 0.0)
+    client = OpenAICompatClient(base_url="http://x", api_key="k", network_retries=3)
+
+    class _AlwaysFail:
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        async def create(self, **_kwargs: Any) -> Any:
+            self.attempts += 1
+            raise _Boom(400)
+
+    failing = _AlwaysFail()
+    client._client = SimpleNamespace(  # type: ignore[assignment]
+        chat=SimpleNamespace(completions=SimpleNamespace(create=failing.create))
+    )
+    with pytest.raises(LLMError):
+        asyncio.run(client.achat(ChatRequest(model="m", messages=[])))
+    assert failing.attempts == 1
+
+
+class _RetryCountClient:
+    """固定返回一个 network_retries=2 的响应，用于验证 meta 透传。"""
+
+    async def achat(self, _request: ChatRequest) -> LLMResponse:
+        return LLMResponse(
+            tool_calls=[ToolCall(id="c", name="vote", arguments={"seat": 2})],
+            raw={"role": "assistant", "content": None},
+            network_retries=2,
+        )
+
+    async def aclose(self) -> None:
+        return None
+
+
+def test_llm_meta_records_network_retries() -> None:
+    legal = [LegalAction(seat=1, type=ActionType.VOTE, allowed_targets=[2, 3])]
+    policy = LLMPolicy(
+        {"mock": _RetryCountClient()},  # type: ignore[dict-item]
+        {1: SeatSpec(provider="mock", model="mock")},
+        GameConfig(),
+    )
+    decision = policy.decide_all(make_state(), legal)[0]
+    assert decision.llm is not None and decision.llm.network_retries == 2

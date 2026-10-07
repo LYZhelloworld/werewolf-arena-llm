@@ -89,11 +89,18 @@ uv run python -m orchestrator.cli --games 50 --summary   # 批量压规则，只
 uv run python -m orchestrator.cli --delay 0.3        # 放慢节奏，一屏一屏地看
 ```
 
-接入 LLM 后的目标形态（尚未实现）：
+服务化与前端（均已实现）：
 
 ```bash
-uv run python -m server.app          # 启动服务
+uv run python -m server.app          # 启动服务，默认 127.0.0.1:8000
 cd web && npm install && npm run dev # 打开前端
+```
+
+前端 TS 类型是**生成物**，由后端 Pydantic 模型产出，不要手写；改了后端模型要重新生成：
+
+```bash
+uv run python -m scripts.gen_ts_types   # 生成（等价于 cd web && npm run gen:types）
+uv run pytest                           # 会校验 types.ts 是否与后端同步
 ```
 
 ## 对局记录
@@ -146,7 +153,7 @@ Orchestrator（对局编排）
 - [x] M5 FastAPI + WebSocket 服务化（REST 启动/回放 + WS 实时事件流）
 - [x] M6 前端观战（大厅 + 对局房间，实时观战 + CoT 面板）
 - [ ] M7 回放与视角切换
-- [ ] M8 遗言、赛后感想与打磨
+- [ ] M8 遗言、赛后感想与打磨（遗言 / 赛后感想 / 上下文压缩 / 异常提示 / TS 类型自动生成已实现；性能优化暂缓）
 
 ## 文档
 

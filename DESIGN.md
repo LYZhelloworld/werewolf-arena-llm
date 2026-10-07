@@ -801,10 +801,15 @@ Provider 差异一律走配置，不在代码里写 `if provider == "moonshot"`�
   「（前情提要：第 1 天 4 号被投出局，2 号与 7 号互相指控……）」。
 - MVP 阶段摘要由模板规则生成（死亡公告 + 投票结果 + 每轮首句），不额外调 LLM。
 
-**M3 实际做法**：上下文采用**增量追加**——每次决策只把「自上次行动以来的新事件」
-渲染成一条 user 消息追加进历史，不重渲染全量历史。因此 `max_public_events`
-的滑动窗口**暂未实现**，单局消息数上限约等于「决策次数 × 3」，
-9 人局通常在 60 条消息以内，尚不构成压力。压缩留到 M8 打磨阶段。
+**M8 实现**：公开历史仍在**增量追加**的基础上做**滑动窗口压缩**（`agents/context.py`）——
+累计渲染的公开事件一旦超过 `max_public_events`，就从**最早的回合**开始，把该回合
+user 消息里的「自上次行动以来：…」事件文本整段丢弃（保留局面与指令，不破坏
+user/assistant/tool 消息结构），并把其中值得保留的行累积成一行模板摘要，插在 system 之后：
+
+> （前情提要：2 号：我是第一个发言的；3 号出局。）
+
+摘要最多保留 `DIGEST_MAX_LINES = 20` 行；`max_public_events <= 0` 表示不压缩。
+压缩是**原地**改写 `messages`，故 `contexts/{seat}.json` 快照即「模型实际看到的内容」。
 - 自己的 CoT 是否留在上下文里由 `thinking.replay` 统一决定（§7.4.2），不再单独设开关：
   有原生推理的模型走结构化字段回传，无原生推理的模型其正文 CoT 本就在历史里。
 
@@ -937,7 +942,7 @@ seer_check / witch_save / witch_poison / witch_pass
 wolf_kill / hunter_shoot / hunter_hold
 memory_write / memory_read
 death / night_deaths_announced
-action_rejected / action_fallback
+action_rejected / action_fallback / llm_downgrade   # 非法动作 / 兜底 / CoT 回传被拒降级（均 spectator）
 roles_revealed                # 赛后感想前向全体揭示真实身份（public）
 game_over / game_aborted
 ```
@@ -1036,8 +1041,23 @@ Orchestrator 持有一个可等待的 gate，暂停时阻塞在下一个 LLM 调
 - React 19 + TypeScript + Vite + Tailwind CSS
 - 状态：zustand（事件流 store，按 seq 追加）
 - 通信：原生 WebSocket + 自动重连
-- 类型：前端 TS 类型由 Pydantic 模型生成 JSON Schema 后转换，**避免两边手写类型不一致**。
-  这是 event `type` / `visibility` 等枚举保持英文的直接原因。
+- 类型：前端 TS 类型**由后端 Pydantic 模型自动生成，不手写**。链路：
+  `engine/events.py` / `server/schemas.py` 的模型 → `model_json_schema()` → JSON Schema →
+  `scripts/gen_ts_types.py` 转成 `web/src/api/types.ts`。
+
+  ```bash
+  uv run python -m scripts.gen_ts_types            # 生成 / 覆盖（前端 npm run gen:types）
+  uv run python -m scripts.gen_ts_types --check    # 只校验不写盘（前端 npm run check:types）
+  ```
+
+  `tests/test_ts_types.py` 会在 `uv run pytest` 时断言两者逐字一致——**改了后端模型却忘了
+  重新生成会直接测试失败**。这是「两边类型静默漂移」的闸门；也是 event `type` / `visibility`
+  等枚举保持英文的直接原因。
+
+  > 为什么自研转换而不用现成工具：只用到 JSON Schema 的一个小子集（object / enum / const /
+  > anyOf / array / `$ref` / additionalProperties），零额外依赖、输出风格可控（英文标识符，
+  > 中文注释随 `Field(description=...)` 带出）。由此形成一条约定：**接口里出现的每个形状都应
+  > 在 `server/schemas.py` 有对应模型**——路由里手写 `dict` 不会进生成结果，也就不会同步到前端。
 
 ---
 
@@ -1067,7 +1087,7 @@ werewolf-arena-llm/
 │   ├── thinking.py              # CoT 捕获（多源兼容）+ 回传决策
 │   ├── tools.py                 # 各阶段 tool schema（动作 + 记忆 + 可选 think）
 │   ├── loop.py                  # 多轮 ReAct 工具循环
-│   ├── context.py               # AgentContext（每席位独立历史，落盘 contexts/）
+│   ├── context.py               # AgentContext（每席位独立历史，落盘 contexts/，含滑动窗口压缩）
 │   ├── prompts.py               # 中文 system prompt 与阶段指令模板
 │   └── policy.py                # LLMPolicy：实现 Policy + decide_all 批量并发
 ├── orchestrator/                # 唯一同时认识引擎与决策方的层
@@ -1078,16 +1098,18 @@ werewolf-arena-llm/
 ├── server/
 │   ├── app.py                # FastAPI 应用工厂 + REST（启动 / 回放）+ WebSocket 实时推送
 │   ├── ws.py                 # GameManager / GameHandle：后台线程跑局、线程安全队列推送、回放读取
-│   ├── schemas.py            # 启动对局的请求 / 响应 schema
+│   ├── schemas.py            # API 契约模型（请求 / 响应 / WS 消息）——前端 TS 类型的生成来源
 │   └── __init__.py
+├── scripts/
+│   └── gen_ts_types.py          # 后端 Pydantic 模型 -> web/src/api/types.ts（--check 供 CI / 测试）
 ├── storage/                     # 全 JSON 持久化
 │   ├── atomic.py                # 临时文件 + os.replace 原子写
 │   ├── event_log.py             # JSONL 追加 + 结束归档 events.json
 │   ├── meta.py                  # meta.json 内容与板子指纹
 │   └── index.py                 # index.json 与历史查询
-├── web/                         # React + Vite + TS
+├── web/                         # React + Vite + TS；src/api/types.ts 是生成物，勿手改
 ├── data/                        # 运行产物（.gitignore）
-├── tests/                       # 引擎单测（重点：规则 + 信息隔离 + CoT 不泄漏）
+├── tests/                       # 引擎单测（规则 + 信息隔离 + CoT 不泄漏）+ 服务端 + 类型同步检查
 └── pyproject.toml
 ```
 
@@ -1105,7 +1127,7 @@ werewolf-arena-llm/
 | **M5 服务化** | FastAPI + WebSocket | REST 启动 / 回放 + WS 实时事件流可用（后台线程跑局，独立队列解耦） |
 | **M6 前端观战** | 大厅 + 对局房间，实时观战 + CoT 面板 | React 应用可看直播 |
 | **M7 回放** | 历史对局列表、回放页、视角切换 | 复盘功能完整 |
-| **M8 打磨** | 遗言 / 赛后感想、异常提示、性能优化 | |
+| **M8 打磨** | 上下文压缩、异常提示、TS 类型自动生成、性能优化（遗言 / 赛后感想已提前实现） | 上下文压缩（v0.12）、异常提示（v0.13）、TS 类型自动生成（v0.14）已实现；性能优化暂缓 |
 
 **建议**：M1 必须做扎实，它是整个项目的地基；M2 的存在是为了让 LLM 接入前先验证规则正确。
 
@@ -1154,3 +1176,6 @@ werewolf-arena-llm/
 | 2026-10-07 | v0.9 | M3 接入 LLM：Agent 运行时落地，含记忆工具（原 M4 提前）：<br>1. **§5.3.1 策略缝扩展**：新增可选批量缝 `decide_all(state, legal) -> list[Decision]`。`Decision` 携带 `thinking` / `llm` 元信息 / `side_events`（记忆读写、兜底留痕）。编排层优先用它，没有则退回逐个 `decide()`，M2 的同步测试因此不受影响。<br>2. **§5.3.2 并发**：主循环保持同步，LLM 策略在 `decide_all` 内部用一次 `asyncio.run` + `gather` 并发打完本阶段所有席位，受全局与 provider 级信号量约束。M5 服务化时把它改成 `await` 即可，编排层其余不动。<br>3. **新增 `agents/`**：`client`（AsyncOpenAI 薄封装）/ `mock`（脚本化客户端，开发期不碰真 key）/ `thinking`（CoT 捕获与回传）/ `tools`（function schema）/ `loop`（多轮 ReAct）/ `context`（每席位独立历史）/ `prompts`（中文模板）/ `policy`（LLMPolicy）。<br>4. **prompt 模板移到 `agents/prompts.py`**（§7.6）：`engine/` 必须保持零 I/O 纯净性。<br>5. **CoT 三来源已实现**：原生 `reasoning_content`（按 `thinking.field` 配置）→ 正文 `content` → `think()` 工具；回传走**独立字段**决不拼进 `content`；遇 400 按 `replay_on_error` 剥离重试并降级本 agent 的 `replay`；`fail` 策略不重试。<br>6. **事件 schema 补 `llm` 字段**（§8.2）：`LlmMeta` 定义在 `engine/events.py`（纯数据，无 LLM 依赖），记录 provider / model / 延迟 / token / 工具轮数 / 是否兜底。<br>7. **记忆工具随 M3 一起做**（原计划 M4）：`memory_write` / `memory_read`，条目数与字数上限按 `agent.memory` 配置，事件以 `private:self` 落盘。<br>8. **上下文压缩延后**：M3 用增量追加（每次只追加「自上次行动以来的新事件」），`context.max_public_events` 的滑动窗口留到 M8。 |
 | 2026-10-07 | v0.10 | M5 服务化（FastAPI + WebSocket），同时并入 M4 文档修正：<br>1. **架构**：React 前端 → FastAPI/WS → Orchestrator → (规则引擎 | Agent 运行时)，引擎与 LLM 互不知晓。<br>2. **关键设计决策**：不把 `GameRunner` 整体 async 化，而是让每局跑在**独立守护线程**里；实时推送**不依赖事件循环**——worker 线程把事件批次放进每个订阅者的普通 `queue.Queue`（线程安全），WebSocket 处理器在自己的事件循环上用 `loop.run_in_executor(None, q.get)` 取批次下发。这样兼容 TestClient（每次请求新 loop）与 uvicorn（单 loop 常驻）。<br>3. **新增 `server/` 包**：`app.py`（路由 + 全开 CORS + `create_app(config_dir, root=None)` 工厂，启动即 `load_board`/`load_game` 校验）、`ws.py`（`GameManager` / `GameHandle`：后台线程跑局、锁保护下 `events.extend` + 写 `event_log` + 遍历 `subscribers` 做 `q.put`、跑完归档 `meta`/`contexts`/`index` 再发 `done`/`error`）、`schemas.py`（`CreateGameRequest` / `CreateGameResponse`）、`__init__.py`。<br>4. **REST 路由**：`POST /games`（构造策略、捕获 `ConfigError`→400、返回 `game_id` + `status`）、`GET /games`、`GET /games/{id}`、`GET /games/{id}/events?seat=`（按 seat 用 `ViewFilter`）。WS：`GET /games/{id}/ws?seat=`（backfill 经 `ViewFilter` 过滤后回灌，再实时推流，终态 `done`/`error` 关闭）。<br>5. **信息隔离在观战流落地**：WS 与 REST 均通过 `ViewFilter` 按 seat 过滤，物理剔除 `thinking`、随 `death` 事件实时关闭私有频道；与 `replay_view` / `view_for` / `filter_events_for` 同源。<br>6. **`engine/visibility.py` 新增 `ViewFilter`**：持有 `seat/role/alive`，`apply(events)` 增量过滤，遇 `death` 且 `actor==seat` 则 `alive=False`，返回的 `thinking` 恒为 None。`replay_view` 改为 `ViewFilter(seat, role).apply(events)`。<br>7. **M4 文档修正并入**：README 路线图补回 M4（已随 M3 实现）；DESIGN §11 里程碑表 M4 行加注「已随 M3 实现（见 §14 v0.9）」、§5.3.2 并发段落改写（明确 M5 实际未整体 async 化，而是后台线程 + 独立队列解耦，引用本版）、§11 目录结构 `server/` 展开为 `app.py / ws.py / schemas.py / __init__.py`。<br>8. **测试**：`tests/test_server.py` 4 个用例（创建并回放 / WS 完整推流 / 座位视角过滤私有频道 / 缺失对局 404），后台线程对局需 `_wait_done` 轮询 `handle.done` 后才读回放；pytest 105 passed、ruff、mypy 全绿。<br>9. **依赖**：`fastapi` 0.142.2 / `uvicorn` 0.54.0 加运行依赖，`httpx` 0.28.1 加测试依赖。 |
 | 2026-10-07 | v0.11 | M6 前端观战（React 19 + Vite + TS + Tailwind v4 + zustand），位于 `web/`：<br>1. **技术栈与目录**：Vite + React 19 + TypeScript + Tailwind v4 + zustand（`useGameStore` 按 `seq` 追加事件）。TS 类型手写对齐 `engine/events.py`（DESIGN §10.4 的「Pydantic 生成 TS」留作后续，当前以注释约定保持 `type`/`visibility` 枚举英文一致）。<br>2. **大厅（Lobby）**：三种开局——Mock 客户端（默认，无需 key）/ 随机策略 / 指定单一模型（需配置 key）；可选随机种子；历史对局列表一键进入观战。`API_BASE` 默认 `http://localhost:8000`，可由 `VITE_API_BASE` 覆盖。<br>3. **对局房间（Room）**：左栏 9 座位卡片（存活/出局、`godView` 显身份与模型名）；中栏按 `day:phase` 分组的时间轴事件流（狼人频道等特殊底色 + 可见性徽标，`render.text` 作中文展示文本）；右栏视角切换 + 阶段/统计（调用次数、token、兜底数）。<br>4. **CoT 面板**：上帝视角下每条发言/决策可展开查看对应 agent 思考（「仅你可见」标记，附 `source` / `replayed`）；切换某玩家视角时服务端按 `seat` 过滤，CoT 与私有频道全部不传（已由 `tests/test_server.py::test_websocket_seat_view_filters_private_channels` 验证）。<br>5. **实时连接**：`useGameConnection` 维护 WebSocket，先回灌历史再实时追加；非 `done` 断线自动重连（重连后服务端重发全量历史）；控制消息 `done`/`error` 与事件靠 `seq` 字段区分，前端按 `seq` 去重追加，避免重复或漏事件。<br>6. **质量门**：`tsc --noEmit` + `vite build` 全过（41 模块，~75KB gzip）；REST 契约联调通过（单局 180 事件，含 `role_assigned`/`death`）；WS 行为与 `tests/test_server.py` 一致。M7 回放页（时间轴拖动/倍速）尚未单独做，但已完成「历史列表 + 进入已完成对局 + 视角切换」的等效能力。 |
+| 2026-10-07 | v0.12 | M8 上下文压缩落地（`context.max_public_events` 滑动窗口，§7.5）：<br>1. **`agents/context.py` 实现滑动窗口压缩**：累计渲染的公开事件超过 `max_public_events` 时，从**最早回合**开始丢弃该回合 user 消息里的「自上次行动以来：…」事件文本（只丢事件文本、保留局面与指令，不破坏 user/assistant/tool 消息结构）。<br>2. **模板摘要**：被丢弃的行里值得保留的（`DIGEST_TYPES` = 死亡公告 / 投票结果 / 身份揭晓 / 每轮首句）累积成一行「（前情提要：…）」插在 system 之后，最多 `DIGEST_MAX_LINES = 20` 行；纯模板生成，不额外调 LLM。<br>3. **原地压缩**：直接改写 `messages`，故 `contexts/{seat}.json` 快照即「模型实际看到的内容」；`max_public_events <= 0` 视为不压缩。<br>4. **接线**：`LLMPolicy._ensure_contexts` 把 `game.context.max_public_events` 传给 `make_context` → `AgentContext`。<br>5. **测试**：`tests/test_agents.py` 新增 3 例（超窗丢弃最早事件且死亡/首句进摘要、任意回合数下保留行数不超过窗口、非正值时禁用）。全量 **110 passed**，ruff / format / mypy 全绿。 |
+| 2026-10-07 | v0.13 | M8 异常提示落地（后端补信号 + 前端四处提示）：<br>1. **补齐后端信号**（此前只落字符串、未成事件）：`agents/loop.py` 在非法动作时发 `action_rejected`（§8.3 早有此类型，此前从未真正发出），在 CoT 回传被拒剥离重试时发 `llm_downgrade`；两者均 spectator，随 `pending_events` 走正常编号落盘。<br>2. **网络重试改为自管**：`agents/client.py` 不再用 SDK 的 `max_retries`（置 0），自己重试并把次数记进 `LLMResponse.network_retries`——可重试状态为连接类错误（无 status）+ 408/409/425/429/5xx，指数退避上限 4s，4xx 不重试；经 `TurnOutcome.network_retries` 写进 `LlmMeta.network_retries`（§7.7）。<br>3. **事件类型**：§8.3 增加 `llm_downgrade`。<br>4. **前端异常提示**（`web/`）：① 顶部 `NoticeBanner` 置顶显示连接错误与「重连中」（`ConnStatus` 新增 `reconnecting`，断线时置位）；② 事件流对 `action_fallback` / `action_rejected` / `llm_downgrade` / `game_aborted` 加特殊底色与徽标；③ 座位卡标出出现过兜底/非法动作的席位；④ 侧栏统计扩展为 6 项（调用 / token / 兜底 / 非法动作 / CoT 降级 / 网络重试），事件行补「重试N」。<br>5. **测试**：`tests/test_agents.py` 新增 4 例（降级事件、重试计数、400 不重试、`LlmMeta.network_retries` 透传），并更新兜底用例断言（现含 4 条 `action_rejected`）。全量 **114 passed**，ruff / format / mypy 全绿；前端 `tsc --noEmit` + `vite build` 通过（42 模块，~76KB gzip）。 |
+| 2026-10-07 | v0.14 | 前端 TS 类型改为**自动生成**（此前手写对齐，§10.4）：<br>1. **补齐 API 契约模型**（`server/schemas.py`）：新增 `GameListItem` / `GameMeta`（列表项与 `meta.json`）、`WsDone` / `WsError` / `WsMessage`（`RootModel[Event \| WsDone \| WsError]` 联合）。`ws.py` 的 `list_games` / `meta_for` 改为构造这些模型，`app.py` 的 `/games`、`/games/{id}` 加 `response_model` —— 契约在运行期被真正校验，不再是「只写在文档里的形状」；行内 `import json` 提到模块顶部。<br>2. **新增 `scripts/gen_ts_types.py`**：收集 `engine/events.py`（`Event` / `Visibility` / `Thinking` / `LlmMeta` / `RenderText`）与 `server/schemas.py` 的模型 → `model_json_schema(ref_template="#/$defs/{model}")` → 合并 `$defs` → 转成 `web/src/api/types.ts`。自研转换器只覆盖用到的 schema 子集（object / enum / const / anyOf / array / `$ref` / additionalProperties），零额外依赖；写入用显式 `newline="\n"`，读取做 CRLF 归一化（本机 `core.autocrlf=true` 会把工作区写成 CRLF）。<br>3. **防漂移**：`--check` 只校验不写盘；`tests/test_ts_types.py` 4 例（逐字一致 / `--check` 返回 0 / 关键类型齐全 / 无 `$ref`·`$defs` 漏出）。前端侧加 `npm run gen:types` 与 `npm run check:types`。<br>4. **`engine/events.py`**：三处行内注释（`Thinking.source`、`Event.type`、`Event.actor`）改为 `Field(description=...)`，让说明随 schema 带进生成的 TS（注释不再只存在于 Python 源码里）。<br>5. **`web/src/api/types.ts` 变为生成物**，首行带「请勿手改」横幅；字段形状与原手写版一致（响应/事件字段全部非可选——后端 `model_dump` 总会带上默认值；仅 `CreateGameRequest` 按 `required` 加 `?`），前端代码无需改动即编译通过。<br>6. **质量门**：全量 **118 passed**（+4），ruff / format / mypy 全绿；前端 `tsc --noEmit` + `vite build` 通过（42 模块，75.75KB gzip）。 |

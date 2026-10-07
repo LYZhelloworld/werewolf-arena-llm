@@ -28,7 +28,12 @@ from engine.events import Event
 from engine.state import Role
 from engine.visibility import ViewFilter
 from orchestrator.cli import build_policy
-from server.schemas import CreateGameRequest, CreateGameResponse
+from server.schemas import (
+    CreateGameRequest,
+    CreateGameResponse,
+    GameListItem,
+    GameMeta,
+)
 from server.ws import GameHandle, GameManager
 
 DEFAULT_CONFIG_DIR = Path(__file__).resolve().parent.parent / "configs"
@@ -74,12 +79,12 @@ def create_app(
         )
         return CreateGameResponse(game_id=handle.game_id)
 
-    @app.get("/games")
-    async def list_games() -> list[dict]:
+    @app.get("/games", response_model=list[GameListItem])
+    async def list_games() -> list[GameListItem]:
         return manager.list_games()
 
-    @app.get("/games/{game_id}")
-    async def game_detail(game_id: str) -> dict:
+    @app.get("/games/{game_id}", response_model=GameMeta)
+    async def game_detail(game_id: str) -> GameMeta:
         meta = manager.meta_for(game_id)
         if meta is None:
             raise HTTPException(status_code=404, detail=f"找不到对局：{game_id}")

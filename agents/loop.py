@@ -61,6 +61,7 @@ class TurnOutcome:
     latency_ms: int = 0
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
+    network_retries: int = 0
     pending_events: list[PendingEvent] = field(default_factory=list)
     rejections: list[str] = field(default_factory=list)
 
@@ -106,6 +107,7 @@ async def run_turn(
         _merge_thinking(outcome.thinking, capture(response.raw, context.thinking), context)
         outcome.tool_turns = turn + 1
         outcome.latency_ms += response.latency_ms
+        outcome.network_retries += response.network_retries
         outcome.prompt_tokens = (outcome.prompt_tokens or 0) + (response.prompt_tokens or 0)
         outcome.completion_tokens = (outcome.completion_tokens or 0) + (
             response.completion_tokens or 0
@@ -179,9 +181,18 @@ async def run_turn(
                 outcome.action = action
                 return outcome
 
-            # 非法：把原因回给模型，让它下一轮重选
-            outcome.rejections.append(reason or "非法动作")
-            results.append((call.id, name, reason or "非法动作"))
+            # 非法：把原因回给模型让它下一轮重选，同时留痕给观众（DESIGN §8.3）
+            detail = reason or "非法动作"
+            outcome.rejections.append(detail)
+            outcome.pending_events.append(
+                PendingEvent(
+                    type="action_rejected",
+                    visibility=Visibility.SPECTATOR,
+                    actor=context.seat,
+                    payload={"tool": name, "reason": detail},
+                )
+            )
+            results.append((call.id, name, detail))
 
         for call_id, tool_name, content in results:
             context.append_tool_result(call_id, tool_name, content)
@@ -225,7 +236,16 @@ async def _request(
         # 剥离历史里的 CoT 重试一次，并把本 agent 的 replay 降级（§7.4.3）
         _strip_reasoning(context.messages)
         context.thinking.replay = False
-        outcome.rejections.append(f"回传思考内容被拒绝，已剥离重试：{exc.message}")
+        detail = f"回传思考内容被拒绝，已剥离重试：{exc.message}"
+        outcome.rejections.append(detail)
+        outcome.pending_events.append(
+            PendingEvent(
+                type="llm_downgrade",
+                visibility=Visibility.SPECTATOR,
+                actor=context.seat,
+                payload={"reason": detail, "status_code": exc.status_code},
+            )
+        )
         return await client.achat(request)
 
 

@@ -51,8 +51,9 @@ export function useGameConnection(gameId: string, seat: number | null) {
 
       ws.onclose = () => {
         if (closedByUs.current) return;
-        // 尚未结束就断了：自动重连，重连后服务端会重新回灌全量历史。
+        // 尚未结束就断了：标记为重连中并自动重连，重连后服务端会重新回灌全量历史。
         if (useGameStore.getState().status !== "done") {
+          setStatus("reconnecting");
           reconnectTimer.current = window.setTimeout(connect, RECONNECT_MS);
         }
       };

@@ -6,11 +6,13 @@ import { deriveSeats, deriveStats } from "../lib/derive";
 import SeatGrid from "../components/SeatGrid";
 import EventStream from "../components/EventStream";
 import SidePanel from "../components/SidePanel";
+import NoticeBanner from "../components/NoticeBanner";
 
 const STATUS_TEXT: Record<string, string> = {
   idle: "空闲",
   connecting: "连接中",
   live: "直播中",
+  reconnecting: "重连中",
   done: "已结束",
   error: "错误",
 };
@@ -63,13 +65,16 @@ export default function Room({
               ? "bg-emerald-700"
               : status === "error"
                 ? "bg-rose-700"
-                : "bg-sky-700"
+                : status === "reconnecting"
+                  ? "bg-amber-700"
+                  : "bg-sky-700"
           }`}
         >
           {STATUS_TEXT[status] ?? status}
         </span>
-        {error && <span className="text-xs text-rose-400">{error}</span>}
       </header>
+
+      <NoticeBanner status={status} error={error} />
 
       <div className="flex min-h-0 flex-1">
         <aside className="w-56 shrink-0 overflow-y-auto border-r border-slate-700 p-3">

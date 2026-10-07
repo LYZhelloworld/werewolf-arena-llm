@@ -35,8 +35,9 @@ class Thinking(BaseModel):
     """
 
     text: str | None = None
-    # reasoning_content | content | think_tool | none
-    source: str = "none"
+    source: str = Field(
+        default="none", description="reasoning_content | content | think_tool | none"
+    )
     replayed: bool = False
 
 
@@ -65,9 +66,9 @@ class Event(BaseModel):
     ts: datetime = Field(default_factory=lambda: datetime.now(UTC))
     day: int
     phase: str
-    type: str  # 英文枚举，见 DESIGN.md §8.3
+    type: str = Field(description="英文枚举，见 DESIGN.md §8.3")
     visibility: Visibility
-    actor: int | None = None  # None 表示系统
+    actor: int | None = Field(default=None, description="None 表示系统事件")
     payload: dict[str, Any] = Field(default_factory=dict)
     thinking: Thinking | None = None
     llm: LlmMeta | None = None

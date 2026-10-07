@@ -69,6 +69,7 @@ class LLMPolicy:
                 model=spec.model,
                 thinking=spec.thinking.model_copy(deep=True),
                 memory=self.game.agent.memory.model_copy(deep=True),
+                max_public_events=self.game.context.max_public_events,
             )
 
     # --- 决策 -------------------------------------------------------------
@@ -126,6 +127,7 @@ class LLMPolicy:
             prompt_tokens=outcome.prompt_tokens,
             completion_tokens=outcome.completion_tokens,
             tool_turns=outcome.tool_turns,
+            network_retries=outcome.network_retries,
             fallback=outcome.fallback,
         )
         if outcome.action is not None:

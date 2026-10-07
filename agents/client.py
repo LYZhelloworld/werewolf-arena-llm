@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import time
 from typing import Any, Protocol
@@ -39,6 +40,8 @@ class LLMResponse(BaseModel):
     prompt_tokens: int | None = None
     completion_tokens: int | None = None
     latency_ms: int = 0
+    # 这次调用在客户端内部重试了几次（网络抖动 / 429 / 5xx），用于异常提示与统计
+    network_retries: int = 0
 
 
 class ChatRequest(BaseModel):
@@ -68,7 +71,11 @@ class LLMClient(Protocol):
 
 
 class OpenAICompatClient:
-    """AsyncOpenAI 的薄封装。"""
+    """AsyncOpenAI 的薄封装。
+
+    网络重试**自己做**（不用 SDK 的 ``max_retries``），这样才能把重试次数
+    记进 :class:`LLMResponse`，进而在事件里可见（DESIGN.md §7.7 / §8.2）。
+    """
 
     def __init__(
         self,
@@ -78,28 +85,35 @@ class OpenAICompatClient:
         network_retries: int = 3,
     ) -> None:
         self.base_url = base_url
-        # 网络层重试交给 SDK；动作非法重试在工具循环里单独计数（DESIGN.md §9.1）
+        self.max_network_retries = max(0, network_retries)
         self._client = AsyncOpenAI(
             base_url=base_url,
             api_key=api_key,
             timeout=timeout_s,
-            max_retries=network_retries,
+            max_retries=0,  # 重试由本类接管，便于计数
         )
 
     async def achat(self, request: ChatRequest) -> LLMResponse:
         started = time.perf_counter()
-        try:
-            response = await self._client.chat.completions.create(
-                model=request.model,
-                messages=request.messages,  # type: ignore[arg-type]
-                tools=request.tools if request.tools else NOT_GIVEN,  # type: ignore[arg-type]
-                temperature=request.temperature,
-                max_tokens=request.max_tokens,
-                extra_body=request.extra_body or None,
-            )
-        except Exception as exc:  # SDK 的异常类型很多，统一收敛成 LLMError
-            status = getattr(exc, "status_code", None)
-            raise LLMError(f"{type(exc).__name__}: {exc}", status_code=status) from exc
+        retries = 0
+        while True:
+            try:
+                response = await self._client.chat.completions.create(
+                    model=request.model,
+                    messages=request.messages,  # type: ignore[arg-type]
+                    tools=request.tools if request.tools else NOT_GIVEN,  # type: ignore[arg-type]
+                    temperature=request.temperature,
+                    max_tokens=request.max_tokens,
+                    extra_body=request.extra_body or None,
+                )
+            except Exception as exc:  # SDK 的异常类型很多，统一收敛成 LLMError
+                status = getattr(exc, "status_code", None)
+                if retries < self.max_network_retries and _is_retryable(status):
+                    retries += 1
+                    await asyncio.sleep(_backoff_seconds(retries))
+                    continue
+                raise LLMError(f"{type(exc).__name__}: {exc}", status_code=status) from exc
+            break
 
         message = response.choices[0].message
         raw = message.model_dump(exclude_none=True)
@@ -128,10 +142,27 @@ class OpenAICompatClient:
             prompt_tokens=getattr(usage, "prompt_tokens", None),
             completion_tokens=getattr(usage, "completion_tokens", None),
             latency_ms=int((time.perf_counter() - started) * 1000),
+            network_retries=retries,
         )
 
     async def aclose(self) -> None:
         await self._client.close()
+
+
+# 值得重试的 HTTP 状态：限流与常见服务端/网关抖动
+RETRYABLE_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+
+
+def _is_retryable(status: int | None) -> bool:
+    """``status`` 为 None 视为连接类错误（超时 / DNS / 连接重置），同样值得重试。"""
+    if status is None:
+        return True
+    return status in RETRYABLE_STATUS
+
+
+def _backoff_seconds(attempt: int) -> float:
+    """指数退避，单次最多 4 秒。``attempt`` 从 1 开始。"""
+    return min(0.5 * (2 ** (attempt - 1)), 4.0)
 
 
 def _parse_arguments(raw: str | None) -> dict[str, Any]:

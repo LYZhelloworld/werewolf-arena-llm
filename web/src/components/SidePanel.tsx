@@ -7,6 +7,7 @@ const STATUS_LABEL: Record<ConnStatus, string> = {
   idle: "空闲",
   connecting: "连接中",
   live: "直播中",
+  reconnecting: "重连中",
   done: "已结束",
   error: "错误",
 };
@@ -97,6 +98,18 @@ export default function SidePanel({
           <div>
             <div className="text-lg text-amber-400">{stats.fallback}</div>
             <div className="text-[10px] text-slate-500">兜底</div>
+          </div>
+          <div>
+            <div className="text-lg text-orange-400">{stats.rejected}</div>
+            <div className="text-[10px] text-slate-500">非法动作</div>
+          </div>
+          <div>
+            <div className="text-lg text-rose-400">{stats.downgraded}</div>
+            <div className="text-[10px] text-slate-500">CoT 降级</div>
+          </div>
+          <div>
+            <div className="text-lg text-sky-400">{stats.retries}</div>
+            <div className="text-[10px] text-slate-500">网络重试</div>
           </div>
         </div>
       </section>

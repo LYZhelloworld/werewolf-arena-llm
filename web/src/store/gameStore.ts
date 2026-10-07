@@ -1,7 +1,7 @@
 import { create } from "zustand";
 import type { Event, GameMeta } from "../api/types";
 
-export type ConnStatus = "idle" | "connecting" | "live" | "done" | "error";
+export type ConnStatus = "idle" | "connecting" | "live" | "reconnecting" | "done" | "error";
 
 interface GameStore {
   gameId: string | null;
