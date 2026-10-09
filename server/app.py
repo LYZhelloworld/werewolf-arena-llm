@@ -26,7 +26,7 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
-from config import ConfigError, load_board, load_game
+from config import ConfigError, load_board, load_game, load_models
 from engine.events import Event
 from engine.visibility import ViewFilter
 from orchestrator.cli import build_policy
@@ -35,6 +35,8 @@ from server.schemas import (
     CreateGameResponse,
     GameListItem,
     GameMeta,
+    ModelListItem,
+    ModelsResponse,
 )
 from server.ws import GameManager
 
@@ -135,6 +137,24 @@ def create_app(
     @app.get("/games", response_model=list[GameListItem])
     async def list_games() -> list[GameListItem]:
         return manager.list_games()
+
+    @app.get("/models", response_model=ModelsResponse)
+    async def list_models() -> ModelsResponse:
+        """当前 ``models.yaml`` 里的全部模型，供前端下拉选择（不校验 key）。
+
+        ``check_keys=False``：这里只是「有哪些模型名可用」，不该因为某个 provider
+        还没配 key 就整个列表都取不到。真正发起对局时才做 key 校验。
+        """
+        try:
+            cfg = load_models(config_dir, check_keys=False)
+        except ConfigError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        items = [
+            ModelListItem(name=model.name, provider=provider_name)
+            for provider_name, provider in cfg.providers.items()
+            for model in provider.models
+        ]
+        return ModelsResponse(models=items)
 
     @app.get("/games/{game_id}", response_model=GameMeta)
     async def game_detail(game_id: str) -> GameMeta:

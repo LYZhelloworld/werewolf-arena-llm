@@ -65,7 +65,7 @@ class MockClient:
 AUX_TOOLS = frozenset({"memory_write", "memory_read", "think"})
 
 
-def auto_responder(speech: str = "我先观察一轮，暂时没有明确判断。") -> Responder:
+def auto_responder(default_text: str = "我先观察一轮，暂时没有明确判断。") -> Responder:
     """一个「总是选第一个合法动作」的脚本化响应器。
 
     让整条链路在没有 API key 的情况下也能跑完整局，用于验证编排、
@@ -73,21 +73,24 @@ def auto_responder(speech: str = "我先观察一轮，暂时没有明确判断�
     """
 
     def respond(request: ChatRequest, _index: int) -> LLMResponse:
+        action_tool: dict[str, Any] | None = None
         for tool in request.tools:
             name = tool.get("function", {}).get("name", "")
             if name in AUX_TOOLS:
                 continue
-            properties = tool.get("function", {}).get("parameters", {}).get("properties", {})
-            arguments: dict[str, Any] = {}
-            if "seat" in properties:
-                seats = properties["seat"].get("enum") or []
-                if not seats:
-                    continue
-                arguments["seat"] = seats[0]
-            if "message" in properties:
-                arguments["message"] = speech
-            return tool_call(name, **arguments)
-        return LLMResponse()
+            action_tool = tool
+            break
+        # 发言类阶段没有动作工具（speak 已被移除）：直接把要说的话作为发言返回。
+        if action_tool is None:
+            return speech(default_text)
+        properties = action_tool.get("function", {}).get("parameters", {}).get("properties", {})
+        arguments: dict[str, Any] = {}
+        if "seat" in properties:
+            seats = properties["seat"].get("enum") or []
+            if not seats:
+                return speech(default_text)
+            arguments["seat"] = seats[0]
+        return tool_call(action_tool["function"]["name"], **arguments)
 
     return respond
 

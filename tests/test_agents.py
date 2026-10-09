@@ -18,7 +18,7 @@ from agents.context import DIGEST_TYPES, AgentContext
 from agents.loop import TurnParams, run_turn
 from agents.mock import MockClient, auto_responder, speech, tool_call
 from agents.policy import LLMPolicy, SeatSpec, specs_from_models
-from agents.prompts import phase_instruction, render_event, system_prompt
+from agents.prompts import phase_instruction, render_event, situation_text, system_prompt
 from agents.tools import build_tools, call_to_action
 from config import (
     AgentMemoryConfig,
@@ -132,7 +132,7 @@ def test_memory_write_then_action_is_two_turns() -> None:
     client = MockClient(
         [
             tool_call("memory_write", key="怀疑", content="2 号发言很急"),
-            tool_call("speak", message="我先记一笔。"),
+            speech("我先记一笔。"),
         ]
     )
     ctx = make_ctx()
@@ -154,7 +154,7 @@ def test_memory_read_returns_written_entries() -> None:
         [
             tool_call("memory_write", key="k", content="v"),
             tool_call("memory_read"),
-            tool_call("speak", message="想起来了。"),
+            speech("想起来了。"),
         ]
     )
     ctx = make_ctx()
@@ -172,7 +172,7 @@ def test_memory_limit_is_enforced() -> None:
         [
             tool_call("memory_write", key="a", content="1"),
             tool_call("memory_write", key="b", content="2"),
-            tool_call("speak", message="满了。"),
+            speech("满了。"),
         ]
     )
     ctx = make_ctx(memory=AgentMemoryConfig(max_entries=1))
@@ -190,51 +190,63 @@ def test_no_action_within_max_turns_falls_back() -> None:
     assert outcome.tool_turns == PARAMS.max_tool_turns
 
 
-def test_model_that_only_talks_is_asked_to_call_tools() -> None:
+def test_speaking_phase_turns_plain_text_into_the_speech_action() -> None:
+    """发言阶段不再有 speak 工具：模型直接说的话就是发言动作，一轮即完成。"""
     legal = [LegalAction(seat=1, type=ActionType.SPEAK)]
-    client = MockClient([LLMResponse(content="我不服"), tool_call("speak", message="好吧")])
+    client = MockClient([LLMResponse(content="我不服")])
     ctx = make_ctx()
     outcome = run(client, ctx, make_state(), legal)
-    assert outcome.action == Action(actor=1, type=ActionType.SPEAK, message="好吧")
+
+    assert outcome.action == Action(actor=1, type=ActionType.SPEAK, message="我不服")
+    assert outcome.tool_turns == 1
+    assert outcome.fallback is False
+    # 不应再追加「请调用工具」这类纠正提示（本阶段压根没有动作工具）
+    assert not any("没有调用工具" in json.dumps(m, ensure_ascii=False) for m in ctx.messages)
+    # 自己的发言要留在历史里
+    assert any(m["role"] == "assistant" and m.get("content") == "我不服" for m in ctx.messages)
+
+
+def test_action_phase_still_asks_for_a_tool_when_model_only_talks() -> None:
+    """动作类阶段（如投票）保留旧行为：只说话不算数，要点名工具催它动手。"""
+    legal = [LegalAction(seat=1, type=ActionType.VOTE, allowed_targets=[2, 3])]
+    client = MockClient([LLMResponse(content="我投 2 号"), tool_call("vote", seat=2)])
+    ctx = make_ctx()
+    outcome = run(client, ctx, make_state(), legal)
+
+    assert outcome.action == Action(actor=1, type=ActionType.VOTE, target=2)
     second = client.calls[1].messages
     # 纠正提示要点名本回合实际可用的工具，而不是泛泛地「请调用一个工具」
     assert any("没有调用工具" in json.dumps(m, ensure_ascii=False) for m in second)
-    assert any("speak" in json.dumps(m, ensure_ascii=False) for m in second)
+    assert any("vote" in json.dumps(m, ensure_ascii=False) for m in second)
 
 
-def test_spoken_reply_is_kept_before_the_tool_reminder() -> None:
-    """只说话的回复必须进历史：否则对话会变成连续多条 user，模型看不见自己说过什么。"""
+def test_speech_after_memory_tool_keeps_assistant_history_well_formed() -> None:
+    """先写记忆、再直接发言：发言进历史，且不会出现连续两条 user。"""
     legal = [LegalAction(seat=1, type=ActionType.SPEAK)]
-    client = MockClient(
-        [speech("我先说两句"), speech("我再补一句"), tool_call("speak", message="好吧")]
-    )
+    client = MockClient([tool_call("memory_write", key="k", content="v"), speech("我先记一笔")])
     ctx = make_ctx()
     run(client, ctx, make_state(), legal)
 
     roles = [m["role"] for m in ctx.messages]
     # 不再出现连续两条 user（以前「催工具」提示会一条条往上叠）
     assert all(not (roles[i] == "user" and roles[i + 1] == "user") for i in range(len(roles) - 1))
-    assert [m.get("content") for m in ctx.messages if m["role"] == "assistant"] == [
-        "我先说两句",
-        "我再补一句",
-        None,  # 最后一次是工具调用，正文为空
-    ]
-    # 每一次纠正提示都排在自己那段发言之后
-    for i, message in enumerate(ctx.messages):
-        if message["role"] == "user" and "没有调用工具" in str(message.get("content")):
-            assert ctx.messages[i - 1]["role"] == "assistant"
+    assistant_texts = [m.get("content") for m in ctx.messages if m["role"] == "assistant"]
+    assert "我先记一笔" in assistant_texts
 
 
 def test_empty_replies_do_not_stack_the_same_reminder() -> None:
-    """模型连回空内容时，同一句纠正提示不该原样堆在历史里。"""
+    """模型连回空内容时，同一句「直接发言」提示不该原样堆在历史里。"""
     legal = [LegalAction(seat=1, type=ActionType.SPEAK)]
-    client = MockClient([LLMResponse() for _ in range(3)] + [tool_call("speak", message="好吧")])
+    client = MockClient([LLMResponse() for _ in range(3)] + [speech("好吧")])
     ctx = make_ctx()
     outcome = run(client, ctx, make_state(), legal)
     assert outcome.action == Action(actor=1, type=ActionType.SPEAK, message="好吧")
-    assert sum("没有调用工具" in str(m.get("content")) for m in ctx.messages) == 1
+    assert sum("请直接发言" in str(m.get("content")) for m in ctx.messages) == 1
     # 空回复不该写进历史，否则会生成服务端拒收的空 assistant 消息
-    assert not any(m["role"] == "assistant" and not m.get("tool_calls") for m in ctx.messages)
+    assert not any(
+        m["role"] == "assistant" and not m.get("tool_calls") and not m.get("content")
+        for m in ctx.messages
+    )
 
 
 # --- CoT -------------------------------------------------------------------
@@ -243,9 +255,8 @@ def test_empty_replies_do_not_stack_the_same_reminder() -> None:
 def test_cot_from_native_reasoning_field() -> None:
     legal = [LegalAction(seat=1, type=ActionType.SPEAK)]
     response = LLMResponse(
-        content=None,
-        tool_calls=[ToolCall(id="c", name="speak", arguments={"message": "我发言"})],
-        raw={"role": "assistant", "content": None, "reasoning_content": "我心里想的是 2 号"},
+        content="我发言",
+        raw={"role": "assistant", "content": "我发言", "reasoning_content": "我心里想的是 2 号"},
     )
     outcome = run(MockClient([response]), make_ctx(), make_state(), legal)
     assert outcome.thinking.text == "我心里想的是 2 号"
@@ -257,7 +268,6 @@ def test_cot_falls_back_to_content() -> None:
     legal = [LegalAction(seat=1, type=ActionType.SPEAK)]
     response = LLMResponse(
         content="我先想想：2 号很可疑",
-        tool_calls=[ToolCall(id="c", name="speak", arguments={"message": "2 号很可疑"})],
         raw={"role": "assistant", "content": "我先想想：2 号很可疑"},
     )
     outcome = run(MockClient([response]), make_ctx(), make_state(), legal)
@@ -267,9 +277,7 @@ def test_cot_falls_back_to_content() -> None:
 
 def test_cot_from_think_tool() -> None:
     legal = [LegalAction(seat=1, type=ActionType.SPEAK)]
-    client = MockClient(
-        [tool_call("think", text="2 号保 3 号，可疑"), tool_call("speak", message="我怀疑 2 号")]
-    )
+    client = MockClient([tool_call("think", text="2 号保 3 号，可疑"), speech("我怀疑 2 号")])
     outcome = run(client, make_ctx(), make_state(), legal)
     assert outcome.thinking.text is not None and "可疑" in outcome.thinking.text
     assert outcome.thinking.source == "think_tool"
@@ -279,7 +287,6 @@ def test_replay_puts_cot_in_its_own_field_never_in_content() -> None:
     legal = [LegalAction(seat=1, type=ActionType.SPEAK)]
     response = LLMResponse(
         content="我发言",
-        tool_calls=[ToolCall(id="c", name="speak", arguments={"message": "我发言"})],
         raw={"role": "assistant", "content": "我发言", "reasoning_content": "秘密思考"},
     )
     ctx = make_ctx(thinking=ThinkingConfig(enabled=True, replay=True))
@@ -295,7 +302,6 @@ def test_replay_disabled_keeps_cot_out_of_history_but_records_it() -> None:
     legal = [LegalAction(seat=1, type=ActionType.SPEAK)]
     response = LLMResponse(
         content="我发言",
-        tool_calls=[ToolCall(id="c", name="speak", arguments={"message": "我发言"})],
         raw={"role": "assistant", "content": "我发言", "reasoning_content": "秘密思考"},
     )
     ctx = make_ctx(thinking=ThinkingConfig(enabled=True, replay=False))
@@ -312,9 +318,8 @@ def test_replay_rejected_by_provider_is_stripped_and_degraded() -> None:
     """回传被拒（400）时剥离重试一次，并把本 agent 的 replay 降级（§7.4.3）。"""
     legal = [LegalAction(seat=1, type=ActionType.SPEAK)]
     ok = LLMResponse(
-        content=None,
-        tool_calls=[ToolCall(id="c", name="speak", arguments={"message": "重来一次"})],
-        raw={"role": "assistant", "content": None, "reasoning_content": "想了一遍"},
+        content="重来一次",
+        raw={"role": "assistant", "content": "重来一次", "reasoning_content": "想了一遍"},
     )
 
     def responder(request: ChatRequest, index: int) -> LLMResponse:
@@ -373,11 +378,10 @@ def test_each_agent_only_sees_its_own_cot() -> None:
     def responder(request: ChatRequest, _index: int) -> LLMResponse:
         seat = seat_of(request.messages)
         return LLMResponse(
-            content=None,
-            tool_calls=[ToolCall(id="c", name="speak", arguments={"message": f"{seat} 号发言"})],
+            content=f"{seat} 号发言",
             raw={
                 "role": "assistant",
-                "content": None,
+                "content": f"{seat} 号发言",
                 "reasoning_content": f"秘密-{seat}",
             },
         )
@@ -415,9 +419,8 @@ def test_cot_is_attached_to_the_action_it_produced() -> None:
     def responder(request: ChatRequest, _index: int) -> LLMResponse:
         seat = seat_of(request.messages)
         return LLMResponse(
-            content=None,
-            tool_calls=[ToolCall(id="c", name="speak", arguments={"message": "刀他"})],
-            raw={"role": "assistant", "content": None, "reasoning_content": f"想-{seat}"},
+            content="刀他",
+            raw={"role": "assistant", "content": "刀他", "reasoning_content": f"想-{seat}"},
         )
 
     policy = LLMPolicy(
@@ -448,7 +451,7 @@ def test_side_events_are_numbered_before_the_action() -> None:
         done = last.get("role") == "tool" and "已记下" in last.get("content", "")
         if not done:
             return tool_call("memory_write", key="刀口", content="先刀神职")
-        return tool_call("speak", message="收到")
+        return speech("收到")
 
     policy = LLMPolicy(
         {"mock": MockClient(responder)},
@@ -602,11 +605,13 @@ def test_specs_from_models_resolves_provider_and_thinking() -> None:
 
 
 def test_mock_client_records_requests_for_isolation_assertions() -> None:
-    client = MockClient([tool_call("speak", message="hi")])
+    client = MockClient([speech("hi")])
     ctx = make_ctx()
-    run(client, ctx, make_state(), [LegalAction(seat=1, type=ActionType.SPEAK)])
+    outcome = run(client, ctx, make_state(), [LegalAction(seat=1, type=ActionType.SPEAK)])
     assert client.call_count == 1
-    assert "speak" in client.tool_names()
+    # 发言阶段不再暴露 speak 工具；模型直接说话即动作。
+    assert outcome.action == Action(actor=1, type=ActionType.SPEAK, message="hi")
+    assert "speak" not in client.tool_names()
 
 
 # --- 板子配置进入 prompt ----------------------------------------------------
@@ -658,11 +663,12 @@ def test_board_section_is_identical_for_every_seat() -> None:
 # --- 阶段指令必须点名工具 ---------------------------------------------------
 
 
-def test_speaking_phases_instruction_names_the_tool() -> None:
-    """说话类阶段的指令必须点名 ``speak``。
+def test_speaking_phases_instruct_direct_speech_without_a_tool() -> None:
+    """发言类阶段的指令要模型「直接发言」，且不再点名 speak 工具。
 
-    实测：狼人协商那一轮的指令只写了「说出你的建议」，9B 模型就老老实实写了段
-    发言然后结束回合，整轮 4 次请求全部白烧，最后走兜底「我没什么可说的」。
+    speak 工具已被移除：模型直接把要说的话写进回复即视为发言动作
+    （见 ``test_speaking_phase_turns_plain_text_into_the_speech_action``）。
+    这几条指令若还留着「用 speak 发言」，等于让模型去调一个不存在的工具。
     """
     state = make_state(roles={1: Role.WEREWOLF, 2: Role.VILLAGER, 3: Role.VILLAGER})
     for phase in (
@@ -673,7 +679,8 @@ def test_speaking_phases_instruction_names_the_tool() -> None:
     ):
         state.phase = phase
         text = phase_instruction(state, 1, [])
-        assert "speak" in text, f"{phase.value} 的指令没有点名工具：{text}"
+        assert "用 speak" not in text, f"{phase.value} 的指令还在点名 speak 工具：{text}"
+        assert "发言" in text or "说出" in text, f"{phase.value} 的指令没有让模型发言：{text}"
 
 
 # --- 上下文压缩（M8） -------------------------------------------------------
@@ -998,3 +1005,33 @@ def test_wolf_chat_instruction_tells_no_lie_to_teammates() -> None:
     text = phase_instruction(state, 1, [])
     assert "无需对内撒谎" in text
     assert "队友" in text
+
+
+def test_witch_situation_reports_remaining_potions() -> None:
+    """女巫每回合的局面摘要都要写明剩余药剂，否则她会以为解药还在（真实踩过）。"""
+    state = make_state(roles={1: Role.WITCH, 2: Role.VILLAGER, 3: Role.VILLAGER})
+    text = situation_text(state, 1)
+    assert "解药可用" in text and "毒药可用" in text
+
+    state.potions.antidote_left = False
+    text2 = situation_text(state, 1)
+    assert "解药已用掉" in text2 and "毒药可用" in text2
+
+    # 非女巫席位不该看到任何药剂信息
+    assert "药剂" not in situation_text(state, 2)
+
+
+def test_witch_instruction_lists_only_available_potions() -> None:
+    """第二夜起只有真正还能用的药才出现在指令里，解药已用就明说、不再劝人救人。"""
+    state = make_state(roles={1: Role.WITCH, 2: Role.VILLAGER, 3: Role.VILLAGER})
+    state.phase = Phase.NIGHT_WITCH
+    state.night.kill_target = 2  # 今夜刀口，满药时应能救
+
+    full = phase_instruction(state, 1, [])
+    assert "witch_save" in full and "witch_poison" in full and "witch_pass" in full
+
+    state.potions.antidote_left = False
+    used = phase_instruction(state, 1, [])
+    assert "witch_save" not in used
+    assert "无法救人" in used
+    assert "witch_pass" in used

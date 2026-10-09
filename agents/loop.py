@@ -6,8 +6,10 @@
 2. 动作工具参数非法 → 把**具体原因**作为 tool result 回给模型重选（不是直接报错）。
 3. 轮数用尽仍无合法动作 → 交给编排层兜底，并打 ``fallback`` 标记。
 4. 不使用 ``tool_choice="required"``——必须先允许模型调辅助工具。
-5. 模型只发言不调工具 → 先把它这段发言写进历史，再**点名本回合可用工具**
-   要它动手。既不静默丢掉它的输出，也不让历史退化成连续多条 user 消息。
+5. 发言类阶段（发言 / 遗言 / 感想）**不再有 speak 工具**：模型直接把要说的话写进
+   回复正文即视为该动作，由本循环把纯文本转成对应 Action 立即返回。这省掉了「先说话、
+   再被催着调 speak 工具」的空转（实测会堆出 4 次空转然后走兜底）。动作类阶段仍沿用
+   第 4 点：只说话没调工具 → 写进历史 + 点名工具要它动手。
 
 回传被 provider 拒绝（400）时的降级也在这里（§7.4.3）。
 """
@@ -26,12 +28,13 @@ from agents.thinking import capture
 from agents.tools import (
     MEMORY_READ,
     MEMORY_WRITE,
+    MESSAGE_TYPES,
     build_tools,
     call_to_action,
     is_memory_tool,
     is_think_tool,
 )
-from engine.actions import Action, LegalAction
+from engine.actions import Action, ActionType, LegalAction
 from engine.events import Event, RenderText, Thinking, Visibility
 from engine.state import GameState
 
@@ -43,6 +46,9 @@ _STRIP_FIELDS = ("reasoning_content", "reasoning", "reasoning_text")
 _TOOL_REMINDER = (
     "你只发言、没有调用工具，这一步还没有生效。请立刻调用一个工具行动，本回合可选：{tools}。"
 )
+
+# 发言类阶段没有动作工具，模型直接说的话就是发言；收到空回复时用这条提醒它开口。
+_SPEAK_REMINDER = "请直接发言，你写下的内容就是本回合的发言，不需要调用任何工具。"
 
 
 class PendingEvent(BaseModel):
@@ -102,6 +108,8 @@ async def run_turn(
         memory_enabled=context.memory.enabled,
         require_think_tool=params.require_think_tool,
     )
+    # 本回合若是发言类阶段（发言 / 遗言 / 感想），模型直接说的话就是动作本身。
+    message_action = _message_action_type(legal)
     targets = sorted({seat for spec in legal for seat in spec.allowed_targets})
     context.begin_turn(state, targets)
 
@@ -125,11 +133,22 @@ async def run_turn(
         )
 
         if not response.tool_calls:
-            # 模型只是说话没有行动：先把这段发言写进历史，再点名工具要它动手。
-            # 不写发言的话，历史会退化成连续多条 user 消息（实测一局堆出 8 条），
-            # 而且模型看不到自己刚说过什么，只会把同一段话原样再说一遍。
-            _record_spoken_reply(context, response)
-            _ask_for_tool(context, tools)
+            text = (response.content or "").strip()
+            if message_action is not None and text:
+                # 发言类阶段：模型直接说的话就是发言动作，不再要求调工具。
+                # 既省掉「说话→被催工具」的空转，也从根上消除「没调 speak」类兜底。
+                context.append_assistant(text, capture(response.raw, context.thinking), [])
+                outcome.action = Action(actor=context.seat, type=message_action, message=text)
+                return outcome
+            if message_action is not None:
+                # 空回复：提醒它直接发言（本阶段本就无动作工具可点名）。
+                _nudge_speak(context)
+            else:
+                # 动作类阶段：先把这段发言写进历史，再点名工具要它动手。
+                # 不写发言的话，历史会退化成连续多条 user 消息（实测一局堆出 8 条），
+                # 而且模型看不到自己刚说过什么，只会把同一段话原样再说一遍。
+                _record_spoken_reply(context, response)
+                _ask_for_tool(context, tools)
             continue
 
         context.append_assistant(
@@ -297,6 +316,18 @@ def _as_tool_call_payload(call: Any) -> dict[str, Any]:
     }
 
 
+def _message_action_type(legal: list[LegalAction]) -> ActionType | None:
+    """本席位本回合若是发言类阶段，返回对应的动作类型（发言 / 遗言 / 感想）。
+
+    发言类阶段的工具已被移除（见 :func:`agents.tools.action_tools`），模型直接
+    输出的正文就是该动作；这里只负责判断「本回合到底是不是这类阶段」。
+    """
+    for spec in legal:
+        if spec.type in MESSAGE_TYPES:
+            return spec.type
+    return None
+
+
 def _record_spoken_reply(context: AgentContext, response: LLMResponse) -> None:
     """把「只说话没动手」的那次回复也留在历史里。
 
@@ -306,6 +337,14 @@ def _record_spoken_reply(context: AgentContext, response: LLMResponse) -> None:
     if not text:
         return
     context.append_assistant(text, capture(response.raw, context.thinking), [])
+
+
+def _nudge_speak(context: AgentContext) -> None:
+    """发言类阶段收到空回复时，提醒模型直接发言（本阶段没有动作工具可点名）。"""
+    reminder = _SPEAK_REMINDER
+    if context.messages and context.messages[-1].get("content") == reminder:
+        return
+    context.messages.append({"role": "user", "content": reminder})
 
 
 def _ask_for_tool(context: AgentContext, tools: list[dict[str, Any]]) -> None:

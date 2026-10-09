@@ -72,6 +72,12 @@ def action_tools(legal: list[LegalAction]) -> list[dict[str, Any]]:
     """当前阶段允许的动作工具。引擎没给的动作不会出现（没得毒就不给毒药）。"""
     tools: list[dict[str, Any]] = []
     for spec in legal:
+        # 发言 / 遗言 / 感想阶段不暴露任何工具：模型直接把要说的话写进回复即可，
+        # 由 agents/loop.py 把纯文本转成对应的 Action（见 DESIGN.md §7.2 第 5 点）。
+        # 这样省掉一次「先说话、再被催着调 speak 工具」的空转，也从根上消除「模型
+        # 没调 speak 工具」这类兜底。
+        if spec.type in MESSAGE_TYPES:
+            continue
         description = ACTION_DESCRIPTIONS.get(spec.type, spec.type.value)
         if spec.type in TARGET_TYPES:
             seats = spec.allowed_targets
@@ -87,20 +93,6 @@ def action_tools(legal: list[LegalAction]) -> list[dict[str, Any]]:
                         }
                     },
                     ["seat"],
-                )
-            )
-        elif spec.type in MESSAGE_TYPES:
-            tools.append(
-                _schema(
-                    spec.type.value,
-                    description,
-                    {
-                        "message": {
-                            "type": "string",
-                            "description": "你要说的话，中文，口语化，不超过 300 字",
-                        }
-                    },
-                    ["message"],
                 )
             )
         else:
@@ -170,7 +162,6 @@ def call_to_action(call: ToolCall, legal: list[LegalAction]) -> tuple[Action | N
         return None, f"当前阶段不能调用 {call.name}，请从可选动作中选择。"
 
     seat = call.arguments.get("seat")
-    message = call.arguments.get("message")
 
     if spec.type in TARGET_TYPES:
         if not isinstance(seat, int):
@@ -181,11 +172,8 @@ def call_to_action(call: ToolCall, legal: list[LegalAction]) -> tuple[Action | N
             )
         return Action(actor=spec.seat, type=spec.type, target=seat), None
 
-    if spec.type in MESSAGE_TYPES:
-        if not isinstance(message, str) or not message.strip():
-            return None, f"{call.name} 需要非空的消息内容。"
-        return Action(actor=spec.seat, type=spec.type, message=message.strip()), None
-
+    # 发言 / 遗言 / 感想阶段不再有对应工具，模型直接说话即动作（由 loop.py 转换）。
+    # 这里只处理剩余的纯动作类工具（无目标参数）。
     return Action(actor=spec.seat, type=spec.type), None
 
 

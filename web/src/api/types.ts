@@ -123,6 +123,22 @@ export interface GameMeta {
   event_count: number | null;
 }
 
+/**
+ * ``GET /models`` 的一项：可选的模型及其所属 provider。
+ * 前端「新建对局（指定模型）」用它把模型名做成下拉框，而不是让用户手输——
+ * 抄错模型名（多一个空格、大小写不对）是最常见的手误，且报错要等到真正发起
+ * 对局才出现。
+ */
+export interface ModelListItem {
+  name: string;
+  provider: string;
+}
+
+/** ``GET /models`` 的返回值：当前 ``models.yaml`` 里配置的全部模型。 */
+export interface ModelsResponse {
+  models: ModelListItem[];
+}
+
 /** WebSocket 控制消息：对局正常结束，之后连接关闭。 */
 export interface WsDone {
   type: "done";

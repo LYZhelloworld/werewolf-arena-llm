@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
-import { API_BASE, createGame, listGames } from "../api/client";
-import type { GameListItem } from "../api/types";
+import { API_BASE, createGame, listGames, listModels } from "../api/client";
+import type { GameListItem, ModelListItem } from "../api/types";
 import { winnerLabel } from "../lib/derive";
 
 type Mode = "mock" | "random" | "model";
@@ -12,6 +12,9 @@ export default function Lobby({ onEnter }: { onEnter: (gameId: string) => void }
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [games, setGames] = useState<GameListItem[]>([]);
+  // 「指定模型」下拉框的选项：来自后端 models.yaml，避免用户手输抄错模型名。
+  const [models, setModels] = useState<ModelListItem[]>([]);
+  const [modelsError, setModelsError] = useState<string | null>(null);
 
   const refresh = () => {
     listGames()
@@ -21,6 +24,14 @@ export default function Lobby({ onEnter }: { onEnter: (gameId: string) => void }
 
   useEffect(() => {
     refresh();
+    listModels()
+      .then((items) => {
+        setModels(items);
+        setModelsError(null);
+        // 默认选中第一个，省得用户面对空选择框
+        setModel((prev) => prev || items[0]?.name || "");
+      })
+      .catch((e) => setModelsError(e instanceof Error ? e.message : String(e)));
   }, []);
 
   const start = async () => {
@@ -66,12 +77,29 @@ export default function Lobby({ onEnter }: { onEnter: (gameId: string) => void }
         </div>
 
         {mode === "model" && (
-          <input
-            className="mt-3 w-full rounded bg-slate-900 px-3 py-2 text-sm text-slate-100 outline-none ring-1 ring-slate-700 focus:ring-indigo-500"
-            placeholder="模型名，如 gpt-4o / deepseek-chat"
-            value={model}
-            onChange={(e) => setModel(e.target.value)}
-          />
+          <div className="mt-3">
+            <select
+              className="w-full rounded bg-slate-900 px-3 py-2 text-sm text-slate-100 outline-none ring-1 ring-slate-700 focus:ring-indigo-500"
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              disabled={models.length === 0}
+            >
+              {models.length === 0 && <option value="">（无可用模型，请检查 models.yaml）</option>}
+              {models.map((m) => (
+                <option key={`${m.provider}/${m.name}`} value={m.name}>
+                  {m.name}（{m.provider}）
+                </option>
+              ))}
+            </select>
+            {modelsError && (
+              <p className="mt-1 text-[11px] text-rose-300">读取模型列表失败：{modelsError}</p>
+            )}
+            {!modelsError && models.length > 0 && (
+              <p className="mt-1 text-[11px] text-slate-500">
+                共 {models.length} 个模型（来自 models.yaml）。
+              </p>
+            )}
+          </div>
         )}
 
         <div className="mt-3 flex items-center gap-3">

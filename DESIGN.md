@@ -646,15 +646,20 @@ defaults:
 
 | 阶段 | 动作工具 |
 | --- | --- |
-| 夜间·狼人协商 | `speak(message)` |
+| 夜间·狼人协商 | 无（直接发言，正文即 `speak`） |
 | 夜间·狼人出刀 | `wolf_vote_kill(seat)` / `abstain()` |
 | 夜间·预言家 | `seer_check(seat)` |
 | 夜间·女巫 | `witch_save()` / `witch_poison(seat)` / `witch_pass()` |
 | 猎人触发 | `hunter_shoot(seat)` / `hunter_hold()` |
-| 白天·讨论 | `speak(message)` |
+| 白天·讨论 | 无（直接发言，正文即 `speak`） |
 | 白天·投票 | `vote(seat)` / `abstain()` |
-| 遗言 | `last_words(message)` |
-| 赛后感想 | `reflect(message)` |
+| 遗言 | 无（直接发言，正文即 `last_words`） |
+| 赛后感想 | 无（直接发言，正文即 `reflect`） |
+
+**关于 `speak` / `last_words` / `reflect`（v0.26 起不再是工具）**：这三类动作的表意
+完全等同于「模型说了一段话」，再要求它额外调一个 `speak(message)` 工具纯属多此一举，
+还会制造「模型只在正文里说话、没调工具」的空转与兜底。现在这几类阶段**不暴露任何动作
+工具**，模型的正文直接转成对应 `Action`（见 §7.2 第 6 点）。
 
 **关于 `abstain()`**：弃权是**显式合法动作**，不是只在兜底时才发生的行为
 （`vote.allow_abstain: true` 时暴露该工具；关闭后不暴露，超时才走 §8.5 的兜底弃权）。
@@ -668,14 +673,21 @@ defaults:
    返回明确原因（如「3 号已出局，请在 1、2、5、7 中选择」）并再次请求。
 4. 轮数超过 `agent.max_tool_turns`（默认 4）仍未产出合法动作 → 走兜底（§8.5）。
 5. **不使用 `tool_choice="required"`**，因为必须先允许模型调用辅助工具。
-6. 模型「只发言、没调任何工具」→ **先把这段发言写进历史**，再追加一条**点名本回合
-   可用工具**的纠正提示，多给一轮。两个约束都有实测依据：
-   - **不能静默丢弃发言**：丢了之后历史会退化成连续多条 `user`（一局实测堆出 8 条），
-     而且模型看不到自己刚说过什么，只会把同一段话原样再说一遍，白烧到轮数用尽。
-   - **纠正提示必须点名工具**：泛泛的「请调用一个工具」对弱模型无效。同理，
-     `prompts.phase_instruction` **每条分支都必须点名本阶段至少一个工具**——
-     只写「说出你的建议」时，9B 模型会老老实实写完一段发言就结束回合（它以为
-     自己已经说过话了），整轮 4 次请求全部白跑（真实教训见 §14 v0.22）。
+6. 模型「只发言、没调任何工具」时分两种情况（v0.26 起区分）：
+   - **发言类阶段**（`speak` / `last_words` / `reflect`）：这几类**不再有工具**
+     （`agents.tools.action_tools` 直接跳过 `MESSAGE_TYPES`）。模型直接输出的正文
+     即视为该动作，`loop.run_turn` 立即把它转成 `Action` 返回，**一轮完成**。这样
+     省掉了「先说话 → 被催着调 speak 工具」的空转，也从根上消除「没调 speak 工具」
+     这类兜底（真实对局里唯一的兜底正是这一类）。对应地，`phase_instruction` 在这几个
+     阶段**不点名任何工具**，只让模型「直接发言 / 留遗言 / 说感想」。
+   - **动作类阶段**（夜晚行动、投票等）：沿用旧逻辑——**先把这段发言写进历史**，再
+     追加一条**点名本回合可用工具**的纠正提示，多给一轮。两个约束都有实测依据：
+     - **不能静默丢弃发言**：丢了之后历史会退化成连续多条 `user`（一局实测堆出 8 条），
+       而且模型看不到自己刚说过什么，只会把同一段话原样再说一遍，白烧到轮数用尽。
+     - **纠正提示必须点名工具**：泛泛的「请调用一个工具」对弱模型无效。同理，
+       `prompts.phase_instruction` 的**动作类分支**必须点名本阶段至少一个工具——
+       只写「说出你的建议」时，9B 模型会老老实实写完一段发言就结束回合（它以为
+       自己已经说过话了），整轮 4 次请求全部白跑（真实教训见 §14 v0.22）。
 
 ### 7.3 记忆工具
 
@@ -931,13 +943,15 @@ user/assistant/tool 消息结构），并把其中值得保留的行累积成一
 
 - **局面段（`situation_text`）**：现状快照。`PROMPT_PHASE_LABELS` 是**面向模型**的指令式措辞
   （如「狼人决定袭击目标」），与面向观众的 `engine.state.PHASE_LABELS`（「夜晚 · 狼人出刀」）是
-  两张不同用途的表（§3.1、§7.2）。
+  两张不同用途的表（§3.1、§7.2）。**女巫席位额外带一行剩余药剂**（「解药可用 / 已用掉，毒药…」）：
+  药跨夜持久化，但每回合的「局面」都必须显式重述，否则模型会凭训练记忆默认解药还在（§14 v0.26）。
 - **增量事件段**：只渲染**本席位可见**且**自上次行动以来新增**的事件（`observe()` 已按
   `filter_events_for` 过滤并物理剔除 `thinking`）。`render_event()` 产出的文本**不带任何频道标记**——
   模型不知道自己读到的这段文字属于哪个频道，否则等于把私有频道的边界暗示给模型（§6）。
-- **阶段指令段（`phase_instruction`）**：**每个分支都点名本回合至少一个工具**
-  （如「用 speak 发言」「用 wolf_vote_kill 选出今晚袭击的目标，可选：2、3、5、…」）。不点名工具时
-  弱模型会写完发言就结束回合（实测 9B 模型整轮只说话，见 §14 v0.22）。
+- **阶段指令段（`phase_instruction`）**：**动作类分支**必须点名本回合至少一个工具
+  （如「用 wolf_vote_kill 选出今晚袭击的目标，可选：2、3、5、…」），不点名时弱模型会写完发言
+  就结束回合（实测 9B 模型整轮只说话，见 §14 v0.22）。**发言类阶段（发言 / 遗言 / 感想）不点名工具**——
+  那几个阶段已无动作工具，模型直接发言即动作（v0.26，见 §7.2 第 6 点）。
 
 示例（平民 7 号，第 2 天白天讨论第 1 轮）：
 
@@ -949,7 +963,7 @@ user/assistant/tool 消息结构），并把其中值得保留的行累积成一
 自上次行动以来：
 3 号：我觉得1号发言很可疑
 
-现在是第 2 天自由讨论第 1 轮，用 speak 发言。
+现在是第 2 天自由讨论第 1 轮，直接说出你的发言。
 ```
 
 #### 7.8.3 assistant（模型响应，CoT 放在独立字段）
@@ -1352,3 +1366,4 @@ werewolf-arena-llm/
 | 2026-10-09 | v0.23 | 新增 §7.8「Agent 上下文的拼接格式（按身份）」，把分散在 §6/§7.2/§7.4/§7.5/§7.6 的提示词拼接逻辑收成一份按身份对照的速查：<br>1. **system 四节固定**：`# 你是谁`（狼人额外带队友名单）/ `# 本局板子`（公开、九席逐字相同）/ `# 与你相关的规则`（按身份拼、只写自己能做的事）/ `# 行为准则`（全身份一致）；并给出五个身份的「# 与你相关的规则」要点表。<br>2. **修正 §7.6 旧样本**：早期版本把「当前局面」「你的私有信息」写进了 system，实际代码里这两块属于**每回合的 user 消息**（§7.8.2），已把 §7.6 的样本改成真实四节结构并加注说明。<br>3. **user 三段式**：`situation_text`（局面快照）+ 增量 `render_event` 文本（只渲染本席位可见且新增的事件，且**不带频道标记**）+ `phase_instruction`（每分支点名工具），附平民 7 号第 2 天讨论轮的完整样例。<br>4. **assistant / tool 两段**：assistant 的 CoT 放在与 `content` 平级的独立字段（`replay` 门控、SPECTATOR 物理剔除、绝不拼进 content），给出三种形态示例；tool 段列出合法动作/被拒原因/记忆读取的回灌文本。<br>5. **按身份可见性对照表**：同一批事件在狼人/预言家/女巫/猎人/平民眼里的差异（✓/✗），强调隔离在事件层完成、提示词本身不负责隐藏。所有样例均取自真实代码渲染，非示意。 |
 | 2026-10-09 | v0.24 | 复盘 `20261009-135756-64976f`（9 席全 qwen3.5-9b，好人胜，4 天）后修两个真 bug + 一个 UI 瑕疵：<br>1. **女巫不知道今夜刀口（设计违反，真 bug）**：`engine/phases.py::_resolve_wolf_vote` 在狼票结算后立即、女巫行动（NIGHT_WITCH）之前，新增一条 `Visibility.WITCH` 的 `wolf_kill` 事件把刀口告诉女巫（"今夜刀口：X 号" / 空刀时 "今夜空刀，无人被袭击"），`saved` 信息此时未定故不带。原实现里 `wolf_kill` 只在 `NIGHT_RESOLVE`（女巫行动**之后**）才以 `Visibility.WOLF` 发出，女巫全程看不到被袭击的是谁，只能盲过——本局女巫 4 号的思考明确写出「我不知道狼人袭击了谁」。DESIGN §4.5/§4.8（`knows_kill_target: true`）与 `private:witch = 刀口信息` 的约定本就要求如此，是代码漏发。新增 `_emit_witch_kill_target()`  helper，三处落刀分支（无人出刀 / 单目标 / 二次平票兜底）各调一次；`render_event` 对 `wolf_kill` 的「今晚的袭击目标是 X 号」文案复用不变。`tests/test_night.py` +3（`test_witch_is_told_kill_target_before_her_turn` / `test_witch_sees_kill_target_in_her_view` / `test_witch_told_when_night_is_empty`）。<br>2. **兜底与本局「我没什么可说的」复盘（非 bug，记录结论）**：本局 5 次 `action_fallback`（席位 5/6 白天讨论、7 投票、9 猎人开枪、9 赛后），全部是「模型限定轮数内没调工具」（`action_rejected` 仍 = 0，属 9B 能力问题）；落地动作均为确定性兜底（有目标的取最小座位号；发言/感想类 fallback 文案正是「我没什么可说的。」）。该文案在 events 里共出现 11 次，其中 3 次是 fallback、8 次是模型自己选的——即弱模型频繁真就没话找话，不是代码 bug。仅需在文档层面提示：fallback 发言与真实发言目前无可区分标记，观众可能误读。<br>3. **UI 思考过程框末尾的 `-- reasoning_content`**：`web/src/components/EventStream.tsx` 的 `CoT` 组件在展开后追加了 `{"\n— "}{thinking.source}{replayed ? " · 已回传" : ""}`，`thinking.source` 是 `reasoning_content` 这类**技术字段名**，对观众无意义。已删除，思考框只显示 `thinking.text`。全量 **144 passed**（+3），ruff / format / mypy / TS 类型同步 / `vite build` 全绿。 |
 | 2026-10-09 | v0.25 | 复盘 `20261009-142405-7d4f15`（9 席全 qwen3.5-9b，狼人胜，4 天）后修三处提示词/压缩问题 + 三处 UI 改动：<br>1. **1 号「平安夜矛盾」= 提示词可读性问题（非逻辑矛盾）**：`render_event` 的 `wolf_kill` 在 `private:wolf` 视图只渲染「今晚的袭击目标是 9 号」、不带「被女巫救下」信息，狼人把「我们刀了9」与「昨夜是平安夜」误读成冲突。已给 `wolf_kill` render 带上 `saved` 状态（被女巫救下 / 已出局 / 未定），狼人据此自动对上两件事。<br>2. **9 号女巫「救人了但不知道救的是谁」= 两层 bug**：① `render_event` 的 `witch_save` 旧文案「你用解药救下了被袭击的玩家」丢了 seat（引擎实际 emit `你用解药救了 {target} 号`）；② 女巫的 `witch_save` 不在 `DIGEST_TYPES`，滑动窗口压缩时整段夜事件被丢弃（实证 `9.json` 第 1 天白天首轮已无「自上次行动以来」段，记忆写「我救人了，但不知道救的是谁」）。已改 `witch_save` render 带 seat，并把 `witch_save`/`witch_poison`/`witch_pass` 一并加入 `DIGEST_TYPES`（压缩后摘要仍保留用药结果）。<br>3. **8 号狼队内部讨论像对民用谎 = 提示词缺明示**：狼队内部 `phase_instruction` 的 `NIGHT_WOLF_CHAT` 分支旧文案「只有队友能听到。用 speak 说出你的建议」没强调「彼此身份已知、无需对内撒谎」。已改为「彼此身份已知，无需伪装、无需对内撒谎」。注：8 号赛后自称「查验了9号」属模型能力问题（他非预言家），非提示词 bug。<br>4. **UI 三处改动**（`web/`）：① 座位卡去掉「兜底 / 非法动作」标记（`SeatGrid.tsx`）；② 左右侧边栏同宽加宽（`Room.tsx` 两侧均 `w-72`）；③ 中间事件栏来新消息且滚动条接近末尾时自动滚到最下（`mainRef` + `onScroll` 近底判定）。<br>5. **测试**：`tests/test_agents.py` 新增 5 例（`render_event` 的 `witch_save`/`witch_poison`/`witch_pass`/`wolf_kill` 各分支、女巫用药进 `DIGEST_TYPES`、狼队指令含「无需对内撒谎」）。全量 **149 passed**（+5），ruff / format / mypy / TS 类型同步 / `vite build` 全绿。 |
+| 2026-10-09 | v0.26 | 复盘 `20261009-145819-004497`（9 席全 qwen3.5-9b，狼人胜）后：**移除 `speak` 工具** + 女巫药剂提示 + 三处 UI 修复（含新建对局模型下拉框）：<br>1. **移除 `speak` / `last_words` / `reflect` 三类「发言工具」**（`agents/tools.py`、`agents/loop.py`、`agents/prompts.py`）：这三类动作的表意就是「模型说了一段话」，再要求它额外调一个带 `message` 参数的工具纯属多此一举。现在 `action_tools` 直接跳过 `MESSAGE_TYPES`（不生成任何动作工具），`loop.run_turn` 在发言类阶段把模型正文**立即转成对应 `Action` 返回**（一轮完成，不再「先说话→被催工具」空转）；`call_to_action` 里对应的 `MESSAGE_TYPES` 分支随之删除（已成死代码）。`system_prompt` 行为准则改为「发言/遗言/感想阶段直接写进回复，其余阶段必须调工具」；`phase_instruction` 的 5 处（狼人协商、白天讨论、平票加时、遗言、赛后）去掉「用 xxx 工具」措辞改为「直接发言/留遗言/说感想」。**本局唯一的 `action_fallback`（seq=91，席位 4，白天讨论）正是这一类**，移除后消除。动作类阶段仍保留「只说话→写进历史+点名工具」逻辑不变。<br>2. **女巫第二夜「忘了自己已用解药」**（`agents/prompts.py`）：`situation_text` 旧版不含药剂信息，模型凭训练记忆默认解药还在；`NIGHT_WITCH` 的指令又把 `witch_save`/`witch_poison`/`witch_pass` 全列出来，不反映「解药已用」。现在 `situation_text` 对女巫席位额外带一行「你的药剂：解药可用/已用掉，毒药可用/已用掉」，`NIGHT_WITCH` 指令按 `state.potions` + `rules.can_witch_save/poisonable_targets` **只列当前真正可用的药**（解药已用则明说「无法救人」）。<br>3. **UI 修「切到某人视角后新消息又变回上帝视角」**（`web/src/hooks/useGameConnection.ts`）：根因是跨 effect 共享的 `closedByUs` ref——切 seat 时旧连接的 `onclose` 会晚于新 effect 把 ref 重置回 false，旧连接误判「非正常断开」而**自动重连**，带着旧视角（常是上帝视角）把事件灌回刚清空的事件流。改用**每次 effect 各自的局部 `cancelled` 标志**，随 effect 一起销毁，从根上消除竞态（server 端过滤本身是对的，有 `test_websocket_seat_view_filters_private_channels` 守卫）。<br>4. **UI 修「狼人视角左栏队友显示 `？`」**（`web/src/components/SeatGrid.tsx`）：旧逻辑非上帝视角只给自己座位显角色。改为狼人视角下按 `seats[].role` 判定队友并显示「狼人」（狼人彼此身份公开，属规则内信息），其余仍显 `？`。<br>5. **UI 新建对局「指定模型」改下拉框**（`server/app.py` 新增 `GET /models` + `server/schemas.py` 新增 `ModelListItem`/`ModelsResponse` + `web/src/api/client.ts::listModels` + `web/src/pages/Lobby.tsx` 改 `<select>`）：模型选项来自 `models.yaml`（`load_models(check_keys=False)`，不因缺 key 就取不到列表），默认选中第一个，不再让用户手输抄错名字。`scripts/gen_ts_types.py` 的 `EXPORTS` 同步加入两个新模型，`web/src/api/types.ts` 重新生成。<br>6. **测试**：`tests/test_agents.py` 改写/新增 8 例（发言阶段正文即动作且不催工具、动作阶段仍催工具、记忆后发言历史结构、空回复提示不堆叠、CoT/回放各例改直连正文、女巫药剂局面与指令只列可用药、发言类指令不再点名 speak）；`tests/test_server.py` +2（`GET /models` 返回配置模型、缺 `models.yaml` 时 400）；`agents/mock.py::auto_responder` 改为「无动作工具时直接发言」（修 `speech` 参数名与函数同名导致的遮蔽） 。全量 **155 passed**，ruff / format / mypy / TS 类型同步 / `vite build` 全绿；另跑一局 mock 全流程确认 `action_fallback`/`action_rejected` 均为 0。 |

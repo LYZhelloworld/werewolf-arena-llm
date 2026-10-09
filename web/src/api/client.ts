@@ -4,6 +4,8 @@ import type {
   Event,
   GameListItem,
   GameMeta,
+  ModelListItem,
+  ModelsResponse,
 } from "./types";
 
 // 默认连本机后端；部署时用 VITE_API_BASE 覆盖。
@@ -47,6 +49,13 @@ export async function createGame(req: CreateGameRequest): Promise<CreateGameResp
 export async function listGames(): Promise<GameListItem[]> {
   const res = await fetch(`${API_BASE}/games`);
   return jsonOrThrow(res, "获取对局列表") as Promise<GameListItem[]>;
+}
+
+// 后端 models.yaml 里配置的全部模型，供「指定模型」下拉框使用。
+export async function listModels(): Promise<ModelListItem[]> {
+  const res = await fetch(`${API_BASE}/models`);
+  const data = (await jsonOrThrow(res, "获取模型列表")) as ModelsResponse;
+  return data.models;
 }
 
 export async function getMeta(gameId: string): Promise<GameMeta> {

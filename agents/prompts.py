@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 from config import BoardConfig
+from engine import rules
 from engine.events import Event
 from engine.state import ROLE_LABELS, GameState, Phase, Player, Role
 
@@ -177,7 +178,8 @@ def system_prompt(seat: int, player: Player, state: GameState) -> str:
         f"{_role_brief(player.role, board)}\n"
         "\n"
         "# 行为准则\n"
-        "- 必须通过调用工具来行动，只在回复里说话不算行动。\n"
+        "- 发言、遗言、赛后感想阶段：直接把要说的话写进回复即可，不需要调用工具。\n"
+        "- 其余阶段（夜晚行动、投票等）必须通过调用工具来行动，只在回复里说话不算行动。\n"
         "- 发言用中文，口语化，像真实玩家：可以分析、指控、辩护、撒谎、伪装。\n"
         "- 需要记住重要信息时用 memory_write，想起来时用 memory_read。\n"
         "- 行动前先用中文简要写下你的推理过程。\n"
@@ -212,48 +214,82 @@ PROMPT_PHASE_LABELS: dict[str, str] = {
 
 
 def situation_text(state: GameState, seat: int) -> str:
-    """局面摘要：存活 / 出局 / 当前阶段。"""
+    """局面摘要：存活 / 出局 / 当前阶段；女巫额外带上剩余药剂。"""
     alive = sorted(s for s, p in state.players.items() if p.alive)
     dead = sorted(s for s, p in state.players.items() if not p.alive)
     alive_text = "、".join(str(s) for s in alive)
     dead_text = "、".join(str(s) for s in dead) if dead else "无"
     label = PROMPT_PHASE_LABELS.get(state.phase, state.phase.value)
-    return f"第 {state.day} 天 · {label}\n存活：{alive_text}（你是 {seat} 号）\n已出局：{dead_text}"
+    lines = [
+        f"第 {state.day} 天 · {label}",
+        f"存活：{alive_text}（你是 {seat} 号）",
+        f"已出局：{dead_text}",
+    ]
+    # 女巫的药跨夜持久化，但每回合的「局面」段必须显式重述剩余药剂：否则模型会
+    # 凭训练记忆默认「解药还在」，在第二夜又去救一个已经被自己救过的人（真实踩过）。
+    player = state.players.get(seat)
+    if player is not None and player.role == Role.WITCH:
+        potions = state.potions
+        antidote = "解药可用" if potions.antidote_left else "解药已用掉"
+        poison = "毒药可用" if potions.poison_left else "毒药已用掉"
+        lines.append(f"你的药剂：{antidote}，{poison}。")
+    return "\n".join(lines)
 
 
 def phase_instruction(state: GameState, seat: int, legal_targets: list[int]) -> str:
     """当前阶段要你做什么（中文）。
 
-    **每条分支都要点名本阶段至少一个工具**：只说「说出你的建议」时，弱模型会
-    老老实实写一段发言然后结束回合（它以为自己已经说过话了），本轮就白跑——
-    实测 9B 模型在没点名工具的阶段整轮 4 次请求全部只说话。工具名见
-    :class:`agents.tools.ActionType`。
+    **动作类阶段仍要点名本阶段至少一个工具**：只说「说出你的建议」时，弱模型会
+    老老实实写一段发言然后结束回合——但那只在动作类阶段会白跑，因为工具类阶段没有
+    「直接说话即动作」的兜底。工具名见 :class:`agents.tools.ActionType`。
+
+    **发言类阶段（发言 / 遗言 / 感想）不再点名工具**：这些阶段已经没有 speak /
+    last_words / reflect 工具，模型直接把要说的话写进回复即视为该动作
+    （见 :func:`agents.loop.run_turn`）。
     """
     phase = state.phase
     if phase in (Phase.NIGHT_WOLF_CHAT, Phase.NIGHT_WOLF_RUNOFF_SPEECH):
         return (
             "现在是狼人内部的私密协商，只有你和队友能听到，彼此身份已知，无需伪装、无需对内撒谎。"
-            "用 speak 说出你的建议：今晚刀谁，为什么。"
+            "直接说出你的建议：今晚刀谁，为什么。"
         )
     if phase in (Phase.NIGHT_WOLF_VOTE, Phase.NIGHT_WOLF_RUNOFF_VOTE):
         return f"用 wolf_vote_kill 选出今晚袭击的目标，可选：{_seats(legal_targets)}。"
     if phase == Phase.NIGHT_SEER:
         return f"用 seer_check 选择今晚查验的对象，可选：{_seats(legal_targets)}。"
     if phase == Phase.NIGHT_WITCH:
-        return "你可以用 witch_save 救人、witch_poison 毒人，或用 witch_pass 不用药。"
+        return _witch_instruction(state)
     if phase in (Phase.NIGHT_HUNTER_SHOOT, Phase.HUNTER_SHOOT):
         return f"你出局了，可以开枪带走一人，可选：{_seats(legal_targets)}；也可 hunter_hold 放弃。"
     if phase == Phase.DAY_DISCUSSION:
-        return f"现在是第 {state.day} 天自由讨论第 {state.round_index + 1} 轮，用 speak 发言。"
+        return f"现在是第 {state.day} 天自由讨论第 {state.round_index + 1} 轮，直接说出你的发言。"
     if phase in (Phase.DAY_VOTE, Phase.DAY_RUNOFF_VOTE):
         return f"用 vote 投票放逐一人，可选：{_seats(legal_targets)}；信息不足可以 abstain 弃权。"
     if phase == Phase.DAY_RUNOFF_SPEECH:
-        return "你们票数持平，用 speak 再发言一轮争取支持。"
+        return "你们票数持平，直接再发言一轮争取支持。"
     if phase == Phase.LAST_WORDS:
-        return "你被放逐了，用 last_words 留下遗言。"
+        return "你被放逐了，直接留下你的遗言。"
     if phase == Phase.POSTGAME:
-        return "比赛结束了，用 reflect 说说你对这局的感想。"
+        return "比赛结束了，直接说说你对这局的感想。"
     return "按当前情况调用工具行动。"
+
+
+def _witch_instruction(state: GameState) -> str:
+    """女巫用药指令，**只列出现在真正能用的药**。
+
+    曾经这里把 witch_save / witch_poison / witch_pass 三个选项一股脑列全，
+    结果解药已经在第一夜用掉的模型，第二夜还会认真「权衡要不要救人」——它
+    以为解药还在。现在按剩余药剂逐一判断：没解药就明说，避免无谓的纠结。
+    """
+    options: list[str] = []
+    if state.potions.antidote_left and rules.can_witch_save(state):
+        options.append("witch_save 救下今夜被狼人袭击的玩家")
+    elif not state.potions.antidote_left:
+        options.append("（你的解药已经用掉，今晚无法救人）")
+    if state.potions.poison_left and rules.poisonable_targets(state):
+        options.append("witch_poison 毒死一名玩家")
+    options.append("witch_pass 今夜不用药")
+    return "你是女巫，到了用药的夜晚，本轮可做：" + "；".join(options) + "。调用对应工具即可。"
 
 
 def _seats(seats: list[int]) -> str:

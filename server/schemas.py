@@ -41,6 +41,24 @@ class CreateGameResponse(BaseModel):
     status: str = "running"
 
 
+class ModelListItem(BaseModel):
+    """``GET /models`` 的一项：可选的模型及其所属 provider。
+
+    前端「新建对局（指定模型）」用它把模型名做成下拉框，而不是让用户手输——
+    抄错模型名（多一个空格、大小写不对）是最常见的手误，且报错要等到真正发起
+    对局才出现。
+    """
+
+    name: str
+    provider: str
+
+
+class ModelsResponse(BaseModel):
+    """``GET /models`` 的返回值：当前 ``models.yaml`` 里配置的全部模型。"""
+
+    models: list[ModelListItem] = Field(default_factory=list)
+
+
 class GameListItem(BaseModel):
     """``GET /games`` 的列表项。进行中的对局 ``running=True`` 且结果字段为空。"""
 

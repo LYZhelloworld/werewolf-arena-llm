@@ -164,6 +164,25 @@ def test_create_game_with_unknown_model_lists_available_models(tmp_path: Path) -
     assert "qwen/qwen3.5-9b" in detail
 
 
+def test_list_models_returns_configured_models(tmp_path: Path) -> None:
+    """``GET /models`` 列出 models.yaml 里的模型，供前端「指定模型」下拉框使用。
+
+    这里**不做 key 校验**：只是「有哪些模型名可用」，不该因为某个 provider 还没配
+    key 就整个列表都取不到。
+    """
+    client, _root = _make_app(tmp_path, models_yaml=_FAKE_MODELS_YAML)
+    resp = client.get("/models")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["models"] == [{"name": "qwen/qwen3.5-9b", "provider": "fake"}]
+
+
+def test_list_models_without_models_yaml_is_400(client: TestClient) -> None:
+    """没配 ``models.yaml`` 时给 400 + 中文修复提示（与建局的报错口径一致）。"""
+    resp = client.get("/models")
+    assert resp.status_code == 400
+    assert "models.yaml" in resp.json()["detail"]
+
+
 def test_missing_game_404(client: TestClient) -> None:
     assert client.get("/games/nope/events").status_code == 404
     assert client.get("/games/nope").status_code == 404
