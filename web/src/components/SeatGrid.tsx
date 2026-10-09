@@ -37,9 +37,6 @@ export default function SeatGrid({
             <div className="text-xs text-slate-300">
               {godView ? roleLabel(s.role) : s.role && mySeat === s.seat ? roleLabel(s.role) : "？"}
             </div>
-            {s.failed && (
-              <div className="mt-0.5 text-[10px] text-amber-400">兜底 / 非法动作</div>
-            )}
             {s.model && (
               <div className="truncate text-[10px] text-slate-500" title={s.model}>
                 {s.model}

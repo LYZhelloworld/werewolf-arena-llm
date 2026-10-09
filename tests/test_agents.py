@@ -14,11 +14,11 @@ from typing import Any
 import pytest
 
 from agents.client import ChatRequest, LLMError, LLMResponse, OpenAICompatClient, ToolCall
-from agents.context import AgentContext
+from agents.context import DIGEST_TYPES, AgentContext
 from agents.loop import TurnParams, run_turn
 from agents.mock import MockClient, auto_responder, speech, tool_call
 from agents.policy import LLMPolicy, SeatSpec, specs_from_models
-from agents.prompts import phase_instruction, system_prompt
+from agents.prompts import phase_instruction, render_event, system_prompt
 from agents.tools import build_tools, call_to_action
 from config import (
     AgentMemoryConfig,
@@ -932,3 +932,69 @@ def test_llm_meta_records_network_retries() -> None:
     )
     decision = policy.decide_all(make_state(), legal)[0]
     assert decision.llm is not None and decision.llm.network_retries == 2
+
+
+# ---------------------------------------------------------------------------
+# render_event 文本（女巫/狼人刀口修正，见 DESIGN §14 v0.25）
+# ---------------------------------------------------------------------------
+
+
+def _ev(type_: str, payload: dict, actor: int | None = None) -> Event:
+    return Event(
+        seq=0,
+        game_id="t",
+        day=1,
+        phase="night",
+        type=type_,
+        visibility=Visibility.PUBLIC,
+        actor=actor,
+        payload=payload,
+    )
+
+
+def test_render_witch_save_includes_seat() -> None:
+    # 旧实现丢掉了 seat，女巫后期会写成「我救人了但不知道救的是谁」。
+    text = render_event(_ev("witch_save", {"seat": 9}, actor=9))
+    assert text is not None
+    assert "9 号" in text
+    assert "解药" in text
+
+
+def test_render_witch_poison_includes_seat() -> None:
+    text = render_event(_ev("witch_poison", {"seat": 6}, actor=5))
+    assert text is not None
+    assert "6 号" in text
+    assert "毒" in text
+
+
+def test_render_witch_pass_says_no_potion() -> None:
+    text = render_event(_ev("witch_pass", {}, actor=5))
+    assert text is not None
+    assert "没有用药" in text
+
+
+def test_render_wolf_kill_shows_saved_status() -> None:
+    # 带上 saved 状态，狼人才能把「我们刀了 X」和「平安夜」对上。
+    saved = render_event(_ev("wolf_kill", {"seat": 9, "saved": True}))
+    assert saved is not None and "9 号" in saved and "被女巫救下" in saved
+    dead = render_event(_ev("wolf_kill", {"seat": 9, "saved": False}))
+    assert dead is not None and "已出局" in dead
+    pending = render_event(_ev("wolf_kill", {"seat": 9}))
+    assert pending is not None and "9 号" in pending
+    assert "被女巫救下" not in pending and "已出局" not in pending
+    empty = render_event(_ev("wolf_kill", {}))
+    assert empty == "今晚空刀。"
+
+
+def test_digest_types_retain_witch_actions() -> None:
+    # 女巫的用药结果必须进摘要，否则压缩后她会彻底忘记自己救/毒了谁。
+    for kind in ("witch_save", "witch_poison", "witch_pass"):
+        assert kind in DIGEST_TYPES
+
+
+def test_wolf_chat_instruction_tells_no_lie_to_teammates() -> None:
+    state = make_state()
+    state.phase = Phase.NIGHT_WOLF_CHAT
+    text = phase_instruction(state, 1, [])
+    assert "无需对内撒谎" in text
+    assert "队友" in text

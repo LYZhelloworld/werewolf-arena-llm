@@ -25,7 +25,18 @@ from engine.visibility import filter_events_for
 MEMORY_FULL = "记忆已达上限（{n} 条），请先精简或合并再写入。"
 
 # 摘要里值得保留的事件类型（DESIGN §7.5：死亡公告 + 投票结果 + 每轮首句）
-DIGEST_TYPES = ("death", "night_deaths_announced", "vote_result", "roles_revealed")
+DIGEST_TYPES = (
+    "death",
+    "night_deaths_announced",
+    "vote_result",
+    "roles_revealed",
+    # 女巫自己的用药结果是她身份相关的关键动作，压缩后也得留痕——
+    # 否则她后期会彻底忘记自己救/毒了谁（实测 9B 模型因此写出「我救人了但不
+    # 知道救的是谁」），而 witch_poison / witch_pass 同理。
+    "witch_save",
+    "witch_poison",
+    "witch_pass",
+)
 # 摘要最多保留的行数，避免摘要本身无限增长
 DIGEST_MAX_LINES = 20
 

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { getMeta } from "../api/client";
 import { useGameStore } from "../store/gameStore";
 import { useGameConnection } from "../hooks/useGameConnection";
@@ -49,6 +49,25 @@ export default function Room({
   const seats = deriveSeats(events, meta);
   const stats = deriveStats(events);
 
+  // 中间栏自动滚动：仅当用户已经贴在底部附近时，新消息才把视口拉到最下；
+  // 用户上滑看历史时（nearBottom=false）不打扰，新消息来了也不会把人拽下去。
+  const mainRef = useRef<HTMLDivElement>(null);
+  const [autoScroll, setAutoScroll] = useState(true);
+
+  useEffect(() => {
+    const el = mainRef.current;
+    if (el && autoScroll) {
+      el.scrollTop = el.scrollHeight;
+    }
+  }, [events, autoScroll]);
+
+  const handleScroll = () => {
+    const el = mainRef.current;
+    if (!el) return;
+    const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
+    setAutoScroll(nearBottom);
+  };
+
   return (
     <div className="flex h-full flex-col">
       <header className="flex items-center gap-3 border-b border-slate-700 px-4 py-2">
@@ -77,13 +96,17 @@ export default function Room({
       <NoticeBanner status={status} error={error} />
 
       <div className="flex min-h-0 flex-1">
-        <aside className="w-56 shrink-0 overflow-y-auto border-r border-slate-700 p-3">
+        <aside className="w-72 shrink-0 overflow-y-auto border-r border-slate-700 p-3">
           <SeatGrid seats={seats} godView={godView} mySeat={seat} />
         </aside>
-        <main className="min-w-0 flex-1 overflow-y-auto p-3">
+        <main
+          ref={mainRef}
+          onScroll={handleScroll}
+          className="min-w-0 flex-1 overflow-y-auto p-3"
+        >
           <EventStream events={events} godView={godView} />
         </main>
-        <aside className="w-64 shrink-0 overflow-y-auto border-l border-slate-700 p-3">
+        <aside className="w-72 shrink-0 overflow-y-auto border-l border-slate-700 p-3">
           <SidePanel
             seat={seat}
             onSeat={setSeat}

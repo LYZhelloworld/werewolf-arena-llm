@@ -231,7 +231,10 @@ def phase_instruction(state: GameState, seat: int, legal_targets: list[int]) -> 
     """
     phase = state.phase
     if phase in (Phase.NIGHT_WOLF_CHAT, Phase.NIGHT_WOLF_RUNOFF_SPEECH):
-        return "现在是狼人内部的私密协商，只有队友能听到。用 speak 说出你的建议：今晚刀谁，为什么。"
+        return (
+            "现在是狼人内部的私密协商，只有你和队友能听到，彼此身份已知，无需伪装、无需对内撒谎。"
+            "用 speak 说出你的建议：今晚刀谁，为什么。"
+        )
     if phase in (Phase.NIGHT_WOLF_VOTE, Phase.NIGHT_WOLF_RUNOFF_VOTE):
         return f"用 wolf_vote_kill 选出今晚袭击的目标，可选：{_seats(legal_targets)}。"
     if phase == Phase.NIGHT_SEER:
@@ -285,15 +288,23 @@ def render_event(event: Event) -> str | None:
         faction = "狼人" if payload.get("faction") == "wolf" else "好人"
         return f"你查验了 {payload.get('seat')} 号：{faction}。"
     if kind == "witch_save":
-        return "你用解药救下了被袭击的玩家。"
+        return f"你用解药救下了 {payload.get('seat')} 号。"
     if kind == "witch_poison":
         return f"你毒死了 {payload.get('seat')} 号。"
     if kind == "witch_pass":
         return "你今夜没有用药。"
     if kind == "wolf_kill":
-        return (
-            f"今晚的袭击目标是 {payload.get('seat')} 号。" if payload.get("seat") else "今晚空刀。"
-        )
+        seat = payload.get("seat")
+        if not seat:
+            return "今晚空刀。"
+        # saved 字段只在该刀口结算（女巫行动之后）才出现：
+        # 带上它能让狼人把「我们刀了 X」和「平安夜」对上，不再误读成矛盾。
+        saved = payload.get("saved")
+        if saved is True:
+            return f"今晚的袭击目标是 {seat} 号（被女巫救下）。"
+        if saved is False:
+            return f"今晚的袭击目标是 {seat} 号（已出局）。"
+        return f"今晚的袭击目标是 {seat} 号。"
     if kind == "vote_result":
         target = payload.get("target")
         if target is None:
