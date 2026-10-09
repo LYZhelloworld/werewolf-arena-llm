@@ -7,7 +7,9 @@ import pytest
 from config import BoardConfig
 from engine.actions import Action, ActionType, IllegalActionError
 from engine.engine import RuleEngine
+from engine.events import Event, Visibility
 from engine.state import DeathCause, Faction, GameState, Phase
+from engine.visibility import is_visible_to, view_for
 
 ENGINE = RuleEngine(BoardConfig())
 
@@ -136,6 +138,65 @@ def test_witch_saves_kill_target() -> None:
     state = witch_act(state, ActionType.WITCH_SAVE)
     assert state.players[7].alive
     assert state.phase == Phase.DAY_DISCUSSION
+
+
+def _drive(events: list[Event], state: GameState, action: Action) -> GameState:
+    state, batch = ENGINE.apply(state, action)
+    events.extend(batch)
+    return state
+
+
+def test_witch_is_told_kill_target_before_her_turn() -> None:
+    """设计 §4.5：女巫每晚得知刀口，且必须在她行动（NIGHT_WITCH）之前收到。
+
+    回归：wolf_kill 曾经只在 NIGHT_RESOLVE 才以 private:wolf 发出，女巫根本
+    看不到被袭击的是谁，只能盲过——模型也确实在真实对局里报告「我不知道狼人袭击了谁」。
+    """
+    state = at_wolf_vote()
+    last: list[Event] = []
+    for seat, target in unanimous(7).items():
+        state, last = ENGINE.apply(
+            state, Action(actor=seat, type=ActionType.WOLF_VOTE_KILL, target=target)
+        )
+    # 狼票结算后立刻进入预言家阶段，但刀口通知应在此时（女巫行动前）发出
+    assert state.phase == Phase.NIGHT_SEER
+    witch_kills = [e for e in last if e.type == "wolf_kill" and e.visibility == Visibility.WITCH]
+    assert witch_kills, "女巫应在狼票结算后立即收到刀口通知"
+    assert witch_kills[0].payload["seat"] == 7
+
+    # 女巫（5 号）可见，狼人（1 号）不可见（那是给女巫的专属频道）
+    witch = state.players[5]
+    assert is_visible_to(witch_kills[0], 5, witch.role, witch.alive)
+    assert not is_visible_to(witch_kills[0], 1, state.players[1].role, True)
+
+
+def test_witch_sees_kill_target_in_her_view() -> None:
+    """女巫进入 NIGHT_WITCH 时，她能看到的事件里必须包含今夜刀口。"""
+    state = at_wolf_vote()
+    events: list[Event] = []
+    for seat, target in unanimous(7).items():
+        state = _drive(
+            events, state, Action(actor=seat, type=ActionType.WOLF_VOTE_KILL, target=target)
+        )
+    state = _drive(events, state, Action(actor=4, type=ActionType.SEER_CHECK, target=1))
+    assert state.phase == Phase.NIGHT_WITCH
+
+    witch_view = view_for(state, events, 5)
+    witch_kills = [e for e in witch_view if e.type == "wolf_kill"]
+    assert len(witch_kills) == 1
+    assert witch_kills[0].payload["seat"] == 7
+
+
+def test_witch_told_when_night_is_empty() -> None:
+    """空刀时女巫也要被告知无人被袭击（解药无从使用，§4.5）。"""
+    state = at_wolf_vote()
+    events: list[Event] = []
+    for seat in (1, 2, 3):
+        state = _drive(events, state, Action(actor=seat, type=ActionType.ABSTAIN))
+    assert state.night.kill_target is None
+    witch_kills = [e for e in events if e.type == "wolf_kill" and e.visibility == Visibility.WITCH]
+    assert witch_kills, "空刀也要通知女巫"
+    assert witch_kills[0].payload["seat"] is None
 
 
 def test_witch_can_not_save_when_no_kill_target() -> None:

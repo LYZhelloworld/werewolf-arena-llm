@@ -15,9 +15,6 @@ function CoT({ thinking }: { thinking: NonNullable<Event["thinking"]> }) {
       {open && (
         <pre className="mt-1 max-h-64 overflow-auto whitespace-pre-wrap rounded border border-fuchsia-800 bg-fuchsia-950/40 p-2 text-[11px] text-fuchsia-200">
           {thinking.text ?? "（该模型未输出思考）"}
-          {"\n— "}
-          {thinking.source}
-          {thinking.replayed ? " · 已回传" : ""}
         </pre>
       )}
     </div>

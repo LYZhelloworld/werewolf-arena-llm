@@ -825,7 +825,8 @@ user/assistant/tool 消息结构），并把其中值得保留的行累积成一
 
 ```
 # 你是谁
-你是 5 号玩家，身份：预言家。你的目标是让好人阵营获胜。
+你是 4 号玩家，身份：预言家。
+一共 9 名玩家，座位号 1 到 9。
 
 # 本局板子
 9 人局：3 狼人、1 预言家、1 女巫、1 猎人、3 平民。当前规则下无警长和警徽竞选。
@@ -835,25 +836,22 @@ user/assistant/tool 消息结构），并把其中值得保留的行累积成一
 - 出局：出局只公布座位号，不公布身份，也不公布死因。只有被投票出局的人有遗言。
 - 胜负：屠边——神职全部出局或平民全部出局即狼人获胜，狼人全部出局则好人获胜。
 
-# 当前局面
-第 2 天 · 白天讨论
-存活玩家：1、2、3、5、6、7、8（你是 5 号）
-已出局：4、9
-
-# 你的私有信息
-- 第 1 夜查验 3 号：狼人
-- 第 2 夜查验 7 号：好人
-
 # 与你相关的规则
-（只列与预言家相关的部分，不泄露其他角色的私有机制）
+- 你每晚可以查验一名存活玩家，只告知对方是好人还是狼人。查验结果只有你自己知道。
+- 亮明身份能带队但会成为狼人的首要目标，权衡时机。
+- 好人获胜条件：所有狼人出局。
 
 # 行为准则
-- 行动前，先用中文写下你的思考过程。这段思考只有观众能看到，其他玩家看不到。
-  （仅对无原生推理能力的模型注入此条；有原生推理的模型不重复要求，避免浪费 token。）
-- 然后通过调用工具来行动，不要只在回复里说话。
-- 你可以用 memory_write 记录重要信息，用 memory_read 读取你记下的内容。
-- 发言不超过 300 字，说人话，像一个真实的玩家，可以撒谎、可以伪装。
+- 必须通过调用工具来行动，只在回复里说话不算行动。
+- 发言用中文，口语化，像真实玩家：可以分析、指控、辩护、撒谎、伪装。
+- 需要记住重要信息时用 memory_write，想起来时用 memory_read。
+- 行动前先用中文简要写下你的推理过程。
+- 不要提及你是人工智能，不要输出任何格式标记以外的内容。
 ```
+
+> 上面是**真实渲染结果**（取自 `agents/prompts.py::system_prompt`，9 人标准局，预言家席位）。
+> 早期版本曾把「当前局面」「你的私有信息」也写进 system；现改为**每回合的 user 消息**携带这些
+> 动态内容（§7.8.2），system 只保留上面四节固定结构，便于压缩与复用。
 
 **「本局板子」一节由 `agents/prompts.py::board_brief(board)` 从 `BoardConfig` 渲染**，
 只写引擎**实际兑现**的规则，绝不在 prompt 里写死一套默认规则。除身份分布与全局规则外，
@@ -886,6 +884,127 @@ user/assistant/tool 消息结构），并把其中值得保留的行累积成一
   属于创建它的那个 loop，跨 loop 复用会抛 `RuntimeError: Event loop is closed`。
   所以「每阶段一套 SDK 客户端，跑完就在同一个 loop 里关掉」。根治要整局共用一个常驻 loop，
   但那与本条「不引入常驻后台线程」的取舍冲突，留待 M5 整体 async 化时一并处理。
+
+### 7.8 Agent 上下文的拼接格式（按身份）
+
+每个席位在 `agents/context.py::AgentContext` 里持有一份**物理独立**的 messages 列表
+（§6.4：隔离是物理的，不是过滤后切分）。整份上下文由 4 种 OpenAI 消息角色拼成，下面以
+9 人标准局为例逐段说明。所有样例均取自真实代码渲染，非示意。
+
+#### 7.8.1 system（四节固定，仅两处随身份变化）
+
+模板在 `agents/prompts.py::system_prompt`，永远是四节（见 §7.6 的真实样本）：
+
+1. `# 你是谁`：座位号、身份中文名；**狼人额外**追加「你的狼人队友是：2 号、3 号。」
+2. `# 本局板子`：`board_brief()` 渲染，**公开信息**，9 个席位逐字相同。
+3. `# 与你相关的规则`：按身份拼不同文案（见下表），**只写自己能做的事**，不泄露他人私有机制。
+4. `# 行为准则`：五条固定要求，所有身份一模一样。
+
+**各身份的「# 与你相关的规则」要点**（节选自真实渲染）：
+
+| 身份 | 该节内容要点 |
+| --- | --- |
+| 狼人 | 每晚与队友私密协商后共同决定袭击谁；白天伪装成好人、可撒谎栽赃；狼人获胜条件。另在 `# 你是谁` 追加队友名单 |
+| 预言家 | 每晚查验一名存活玩家，只告知好/狼；亮明身份权衡时机；好人获胜条件 |
+| 女巫 | 解药毒药各一次、首夜可自救、同夜不能两药齐用、每晚得知狼刀谁；好人获胜条件 |
+| 猎人 | 出局可开枪带走一人；触发时机（被票/被刀）；被毒不能开枪；可放弃；好人获胜条件 |
+| 平民 | 无特殊能力，靠发言投票找狼；好人获胜条件 |
+
+> `system` 里**不出现任何动态信息**（当前局面、私有查验结果等），这些都在每回合的 user 消息里。
+
+#### 7.8.2 user（每回合一条，由 `begin_turn` 拼装）
+
+每回合调用 `AgentContext.begin_turn(state, targets)`，把三段用空行拼成**一条** user 消息：
+
+```
+第 {day} 天 · {PROMPT_PHASE_LABELS[phase]}
+存活：{alive}（你是 {seat} 号）
+已出局：{dead}
+
+自上次行动以来：
+{把本席位可见、且尚未读过的事件逐条 render_event 成中文，每条一行}
+
+{phase_instruction(state, seat, targets)}
+```
+
+要点：
+
+- **局面段（`situation_text`）**：现状快照。`PROMPT_PHASE_LABELS` 是**面向模型**的指令式措辞
+  （如「狼人决定袭击目标」），与面向观众的 `engine.state.PHASE_LABELS`（「夜晚 · 狼人出刀」）是
+  两张不同用途的表（§3.1、§7.2）。
+- **增量事件段**：只渲染**本席位可见**且**自上次行动以来新增**的事件（`observe()` 已按
+  `filter_events_for` 过滤并物理剔除 `thinking`）。`render_event()` 产出的文本**不带任何频道标记**——
+  模型不知道自己读到的这段文字属于哪个频道，否则等于把私有频道的边界暗示给模型（§6）。
+- **阶段指令段（`phase_instruction`）**：**每个分支都点名本回合至少一个工具**
+  （如「用 speak 发言」「用 wolf_vote_kill 选出今晚袭击的目标，可选：2、3、5、…」）。不点名工具时
+  弱模型会写完发言就结束回合（实测 9B 模型整轮只说话，见 §14 v0.22）。
+
+示例（平民 7 号，第 2 天白天讨论第 1 轮）：
+
+```
+第 2 天 · 白天 · 自由讨论
+存活：1、2、3、5、6、7、8、9（你是 7 号）
+已出局：4
+
+自上次行动以来：
+3 号：我觉得1号发言很可疑
+
+现在是第 2 天自由讨论第 1 轮，用 speak 发言。
+```
+
+#### 7.8.3 assistant（模型响应，CoT 放在独立字段）
+
+一次响应被 `agents/thinking.py::build_assistant_message` 拼成一段 assistant 消息：
+
+```json
+{"role":"assistant","content":"我怀疑1号……","reasoning_content":"1号昨晚没被刀，可能是狼"}
+```
+
+- `content`：模型的正文发言（自由文本，可能为 null，此时只剩 `tool_calls`）。
+- `tool_calls`：本次调用的工具，结构与 OpenAI function call 一致
+  （`id` / `type:"function"` / `function.name` / `function.arguments` JSON 字符串）。
+- **CoT 字段**：`thinking` 放在与 `content` **平级**的独立字段里（`reasoning_content` 或
+  `thinking.field` 配置指定的名字），**绝不拼进 content**（Qwen 官方明示会掉效果）。是否落进历史
+  由 `thinking.replay` 决定：
+  - `replay=True` → `{"role":"assistant","content":"…","reasoning_content":"…"}`
+  - `replay=False` → `{"role":"assistant","content":"…"}`（历史里不出现 CoT，但事件流里的
+    `thinking.text` 仍全量记录，见 §7.4）
+  - 仅 tool_call、无正文 → `{"role":"assistant","tool_calls":[…]}`（连 `content` 都没有）
+
+> CoT 对**所有玩家**都不可见（visibility=SPECTATOR），构建上下文时已被物理剔除；这里的「回传」
+> 只是把**观众可见**的思考回灌给同一模型自己，别的 agent 永远拿不到（§6.2）。
+
+#### 7.8.4 tool（工具执行结果回灌）
+
+每次工具调用后追加一条 `role:"tool"` 消息（带 `tool_call_id` / `name` / `content`）：
+
+- 合法动作：`"已执行。"`
+- 动作被拒（参数非法/越权）：把**具体原因**作为 content 回给模型重选
+  （如 `"8 号不是合法目标，请在 1、2、3、5、6、7、8、9 中选择。"`），同时记 `action_rejected` 事件给观众（§8.3）
+- `memory_read`：回灌全部已记条目文本
+- `think` / `memory_write`：回灌简短确认（`"已记录你的思考。"` / `"已记下：怀疑3号"`）
+
+#### 7.8.5 不同身份「能看到什么」对照
+
+隔离在事件层完成（`filter_events_for` + CoT 物理剔除），提示词本身不负责隐藏。下表是同一批事件
+在几个身份眼里的差别（✓ = 该身份 user 消息里会出现这段文字）：
+
+| 事件（原始） | 狼人 | 预言家 | 女巫 | 猎人 | 平民 |
+| --- | --- | --- | --- | --- | --- |
+| `3 号：我觉得1号发言很可疑`（public） | ✓ | ✓ | ✓ | ✓ | ✓ |
+| `2 号：今晚刀5号`（wolf 频道） | ✓ | ✗ | ✗ | ✗ | ✗ |
+| `你查验了 7 号：好人。`（seer 私有） | ✗ | ✓ | ✗ | ✗ | ✗ |
+| `你用解药救下了被袭击的玩家。`（witch 私有） | ✗ | ✗ | ✓ | ✗ | ✗ |
+| 任一玩家的 `thinking` | ✗ | ✗ | ✗ | ✗ | ✗ |
+
+注意：`render_event()` 对狼人频道发言只输出 `2 号：今晚刀5号`，**不写「（仅狼人可见）」**；
+模型只能从「别人从来不提这件事」推断这是私密信息。
+
+#### 7.8.6 压缩（长局降窗口）
+
+公开历史超过 `context.max_public_events` 时，`AgentContext._compact()` 丢弃最早回合的事件文本、
+累积摘要插在 system 之后（§7.5）。压缩是**原地**改写 messages，所以 `snapshot()` 导出的就是
+模型实际看到的内容。system / 每回合 situation+instruction 永远保留，不破坏消息结构。
 
 ---
 
@@ -1230,3 +1349,5 @@ werewolf-arena-llm/
 | 2026-10-07 | v0.20 | 修「网页大厅选『指定模型』就启动失败」——两个原因叠在一起，且**错误信息根本到不了前端**：<br>1. **`build_policy` 依赖 `argparse.Namespace`**：CLI 与服务层共用它，服务层构造 `Namespace(random=…, model=…, seed=…)` 时少传了 `config_dir`，而 `--model` 分支要 `load_models(args.config_dir)` → `AttributeError` → **500**。（mock / random 分支走不到那一行，所以此前 6 个服务层测试全绿也没暴露。）<br>2. **模型名不存在时抛 `KeyError`**：`specs_from_models` 用裸 `KeyError` 表示「models.yaml 里没有这个模型」，同样冒成 500。用户只要抄错一次名字（最常见是漏掉 `qwen/qwen3.5-9b` 的 `qwen/` 前缀）就会撞上。<br>3. **为什么用户只看到一句 `Failed to fetch`**：未捕获异常由 `ServerErrorMiddleware` 在 **CORS 中间件外层**生成 500 响应，该响应**不带 `Access-Control-Allow-Origin`**，浏览器据此直接判定为网络层失败，响应体根本到不了前端——于是「500 + 原因」在界面上退化成「连不上」。**设计约束：所有可预期的失败都必须走 `HTTPException`**（在 CORS 内层被 `ExceptionMiddleware` 处理，响应带 CORS 头），绝不让异常裸奔。<br>4. **修复**：`build_policy` 改为**显式关键字参数**（`game, total_seats, *, model, random, seed, config_dir`），取消 Namespace 鸭子类型——少传/写错字段从此是 mypy 报错而非运行时 500；`specs_from_models` 找不到模型改抛 `ConfigError` 并**列出可用模型**；CLI 的 `load_models` / `build_policy` 两处也补 `except ConfigError`（中文提示 + 退出码 1，不再甩 traceback）；前端 `client.ts::jsonOrThrow` 解析 `{"detail": …}`，提示不再带花括号与引号。<br>5. **测试**：`tests/test_server.py` +3（指定模型能起局、缺 models.yaml → 400、模型名写错 → 400 且列出可用值），`tests/test_agents.py` 的 `KeyError` 断言改为 `ConfigError` 并断言含可用模型清单，全量 **135 passed**。另在**真实 uvicorn**（`TestClient` 不走真实 CORS，覆盖不到本问题）下验证：错模型名 → `400` + `access-control-allow-origin: *` + 中文可用模型列表。 |
 | 2026-10-07 | v0.21 | 第二次真实对局（`20261007-133149-af3f3c`）复盘后的两项修复：观战文案，以及**25 次假「网络重试」**。<br>1. **每个事件都必须带 `render.text`**（§8.2 新增约定）：此前只有部分引擎事件有展示文本，其余落到前端的 `JSON.stringify(payload)` 兜底——界面上真实出现「进入阶段：night_wolf_chat」与赤裸的 `{"target":8}`。现在补齐全链路：`phase_enter` 用新增的 `engine.state.PHASE_LABELS` 渲染；`vote_cast`（按动作类型分「N 号选择刀 X 号」/「N 号投给 X 号」）、`vote_abstain`、`vote_result`（日夜双方 × 单人出局 / 无人出局 / 二次平票 / 座位号兜底）、`vote_tie`、`wolf_kill`、`witch_pass` 全部补齐；**agent 侧事件**（`memory_write` / `memory_read` / `action_rejected` / `llm_downgrade` / `action_fallback`）也给 `PendingEvent` 加了 `render` 字段并逐条写文案。前端 `eventText()` 由此从「按 type switch 十几个分支」退化为「取 `render.text`，取不到才兜底」——**翻译责任回到产生事件的那一层**，前端不再各自解释 payload。<br>2. **阶段文案收口为一份**：新增 `engine.state.PHASE_LABELS` + `phase_label()` 作为 UI 文案唯一事实来源；终端渲染器改为 import（删掉本地副本）；`agents/prompts.py` 里同名的表**改名** `PROMPT_PHASE_LABELS` 并注明它面向模型、措辞故意不同（"狼人决定袭击目标" vs "夜晚 · 狼人出刀"）；前端那张表仍在 TS（没法 import Python），守卫测试从「只比 key」升级为 **key 与 value 逐字比对**。<br>3. **修 25 次假重试**（真 bug）：`asyncio.run` 每个阶段换一个 event loop，而 httpx 的连接池绑定在创建它的 loop 上，跨 loop 复用抛 `RuntimeError: Event loop is closed`（`status_code` 为 None）。旧判定是「没状态码就重试」，于是**每个阶段的第一条请求必定假重试一次**——96 次调用报出 25 次重试，正好等于阶段数 26 减一，且每次都是该阶段第一个出场的席位。观战界面把它标成橙色「重试」，看起来像网络差，实为连接池用错了 loop。三层修：① `OpenAICompatClient._sdk()` 按 loop 缓存 SDK 客户端，换 loop 换一套；② `LLMPolicy._decide_batch` 在 `finally` 里 `aclose()` 掉本阶段客户端（留着不关，GC 时会往已关闭的 loop 上安排关闭动作，控制台每次刷一段 `Event loop is closed` 噪音）；③ **重试判定收紧**为「有状态码看 `RETRYABLE_STATUS`；无状态码只认 `APIConnectionError` / `APITimeoutError` / httpx·httpcore·ssl 系异常」，其余立刻抛出——编程错误不能再被重试掩盖（§7.7）。<br>4. **兜底结论（不是设计问题）**：本局 3 次兜底（3/96≈3%）全是「模型未在限定轮数内给出合法动作」，而 `action_rejected` 为 **0**——模型根本没调动作工具（只在正文里说话），不是参数写错，属模型能力问题。顺带确认 `prompt_tokens` 是多轮**累加**值（4 轮 ≈ 7000×4 ≈ 31.5k），不是上下文膨胀。<br>5. **测试与验证**：`test_full_game.py` 新增「60 局内没有任何事件缺 `render.text`」（新增事件类型忘写文案会立刻红）；`test_agents.py` +4（记忆 / 异常事件带 render、编程错误不重试、跨 loop 重建客户端、同 loop 内复用）；`test_ts_types.py` 阶段标签守卫升级。全量 **138 passed**（+3），ruff / format / mypy / TS 类型同步全绿；前端 `vite build` 42 模块 75.86KB gzip。另用**本地假 OpenAI 服务端**做端到端验证：26 个阶段 78 次请求全部一次成功、总重试 0、无 stderr 噪音。 |
 | 2026-10-07 | v0.22 | 接着复盘同一局（`20261007-133149-af3f3c`），发现「兜底」里**有一半确实是设计问题**：<br>1. **根因一：阶段指令没点名工具**（`prompts.phase_instruction`）——全表只有「夜间·狼人协商」写了「说出你的建议」而不给工具名（「白天·加时发言」同样），而该阶段的动作工具 `speak` 在 §7.2 的表里本来就是明写的。9B 模型于是老老实实写完一段发言就结束回合（它以为自己已经说过话了）。**本局 3 次兜底中的 1 次（`night_wolf_chat` 席位 5）正落在这一条上**。修复：两条分支都点名 `speak`，并在 docstring 里把「每条分支都要点名工具」写成约束。<br>2. **根因二：只说话的回复被静默丢弃**（`agents/loop.py`）——原分支直接 `context.messages.append({"role":"user", "content":"你必须通过调用工具来行动，请调用一个工具。"})` 然后 `continue`，**没有把模型这次发言写进历史**。后果有两个：① 历史退化成**连续多条 `user`**，本局实测 `5.json` 堆出 8 条连续 user、`1.json` 6 条，那句提示在 `5.json` 里出现 **9 次**；② 模型看不到自己刚说过什么，只能把同一段话原样再说一遍，4 轮全白烧。修复：先 `_record_spoken_reply()` 把发言写进历史（正文为空时不写，否则是服务端会拒收的空 assistant 消息），再 `_ask_for_tool()` 追加**点名本回合可用工具**的纠正提示（如「…本回合可选：speak、memory_write、memory_read。」），且同一条提示不重复堆叠。<br>3. **剩余的兜底才是模型能力问题**：本局另 2 次（`day_discussion` 席位 1 与 5，同一批次 1 ms 内触发）该阶段的指令本来就点了名，属 9B 模型自身不稳定；`action_rejected` 仍为 **0**，即从未出现「调了工具但参数非法」。<br>4. **测试**：`tests/test_agents.py` +3 —— `test_speaking_phases_instruction_names_the_tool`（四个说话类阶段都必须点名 `speak`）、`test_spoken_reply_is_kept_before_the_tool_reminder`（历史里不得出现连续两条 `user`，且每条纠正提示都排在自己那段发言之后）、`test_empty_replies_do_not_stack_the_same_reminder`（空回复时同一句提示只留一条）。全量 **141 passed**（+3），ruff / format / mypy / TS 类型同步全绿。 |
+| 2026-10-09 | v0.23 | 新增 §7.8「Agent 上下文的拼接格式（按身份）」，把分散在 §6/§7.2/§7.4/§7.5/§7.6 的提示词拼接逻辑收成一份按身份对照的速查：<br>1. **system 四节固定**：`# 你是谁`（狼人额外带队友名单）/ `# 本局板子`（公开、九席逐字相同）/ `# 与你相关的规则`（按身份拼、只写自己能做的事）/ `# 行为准则`（全身份一致）；并给出五个身份的「# 与你相关的规则」要点表。<br>2. **修正 §7.6 旧样本**：早期版本把「当前局面」「你的私有信息」写进了 system，实际代码里这两块属于**每回合的 user 消息**（§7.8.2），已把 §7.6 的样本改成真实四节结构并加注说明。<br>3. **user 三段式**：`situation_text`（局面快照）+ 增量 `render_event` 文本（只渲染本席位可见且新增的事件，且**不带频道标记**）+ `phase_instruction`（每分支点名工具），附平民 7 号第 2 天讨论轮的完整样例。<br>4. **assistant / tool 两段**：assistant 的 CoT 放在与 `content` 平级的独立字段（`replay` 门控、SPECTATOR 物理剔除、绝不拼进 content），给出三种形态示例；tool 段列出合法动作/被拒原因/记忆读取的回灌文本。<br>5. **按身份可见性对照表**：同一批事件在狼人/预言家/女巫/猎人/平民眼里的差异（✓/✗），强调隔离在事件层完成、提示词本身不负责隐藏。所有样例均取自真实代码渲染，非示意。 |
+| 2026-10-09 | v0.24 | 复盘 `20261009-135756-64976f`（9 席全 qwen3.5-9b，好人胜，4 天）后修两个真 bug + 一个 UI 瑕疵：<br>1. **女巫不知道今夜刀口（设计违反，真 bug）**：`engine/phases.py::_resolve_wolf_vote` 在狼票结算后立即、女巫行动（NIGHT_WITCH）之前，新增一条 `Visibility.WITCH` 的 `wolf_kill` 事件把刀口告诉女巫（"今夜刀口：X 号" / 空刀时 "今夜空刀，无人被袭击"），`saved` 信息此时未定故不带。原实现里 `wolf_kill` 只在 `NIGHT_RESOLVE`（女巫行动**之后**）才以 `Visibility.WOLF` 发出，女巫全程看不到被袭击的是谁，只能盲过——本局女巫 4 号的思考明确写出「我不知道狼人袭击了谁」。DESIGN §4.5/§4.8（`knows_kill_target: true`）与 `private:witch = 刀口信息` 的约定本就要求如此，是代码漏发。新增 `_emit_witch_kill_target()`  helper，三处落刀分支（无人出刀 / 单目标 / 二次平票兜底）各调一次；`render_event` 对 `wolf_kill` 的「今晚的袭击目标是 X 号」文案复用不变。`tests/test_night.py` +3（`test_witch_is_told_kill_target_before_her_turn` / `test_witch_sees_kill_target_in_her_view` / `test_witch_told_when_night_is_empty`）。<br>2. **兜底与本局「我没什么可说的」复盘（非 bug，记录结论）**：本局 5 次 `action_fallback`（席位 5/6 白天讨论、7 投票、9 猎人开枪、9 赛后），全部是「模型限定轮数内没调工具」（`action_rejected` 仍 = 0，属 9B 能力问题）；落地动作均为确定性兜底（有目标的取最小座位号；发言/感想类 fallback 文案正是「我没什么可说的。」）。该文案在 events 里共出现 11 次，其中 3 次是 fallback、8 次是模型自己选的——即弱模型频繁真就没话找话，不是代码 bug。仅需在文档层面提示：fallback 发言与真实发言目前无可区分标记，观众可能误读。<br>3. **UI 思考过程框末尾的 `-- reasoning_content`**：`web/src/components/EventStream.tsx` 的 `CoT` 组件在展开后追加了 `{"\n— "}{thinking.source}{replayed ? " · 已回传" : ""}`，`thinking.source` 是 `reasoning_content` 这类**技术字段名**，对观众无意义。已删除，思考框只显示 `thinking.text`。全量 **144 passed**（+3），ruff / format / mypy / TS 类型同步 / `vite build` 全绿。 |

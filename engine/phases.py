@@ -183,6 +183,29 @@ def resolve_phase(state: GameState, emit: EmitFn) -> Phase:
 # ---------------------------------------------------------------------------
 
 
+def _emit_witch_kill_target(state: GameState, emit: EmitFn) -> None:
+    """把今夜刀口告诉女巫（设计 §4.5：女巫每晚得知刀口，才能决定救不救）。
+
+    必须在女巫行动（NIGHT_WITCH）之前发出，可见性 private:witch。
+    此时 save 尚未发生，故不带 saved 字段；女巫只得知「被袭击的是几号」。
+    """
+    target = state.night.kill_target
+    if target is None:
+        emit(
+            "wolf_kill",
+            Visibility.WITCH,
+            payload={"seat": None},
+            render=RenderText(text="今夜空刀（狼人未选出刀口），无人被袭击。"),
+        )
+    else:
+        emit(
+            "wolf_kill",
+            Visibility.WITCH,
+            payload={"seat": target},
+            render=RenderText(text=f"今夜刀口：{target} 号"),
+        )
+
+
 def _resolve_wolf_vote(state: GameState, emit: EmitFn, runoff: bool) -> Phase:
     counts = rules.tally(state.votes)
     tops = rules.top_candidates(counts)
@@ -196,6 +219,7 @@ def _resolve_wolf_vote(state: GameState, emit: EmitFn, runoff: bool) -> Phase:
             payload={"target": None, "counts": payload_counts, "tied": []},
             render=RenderText(text=f"狼人没有选出刀口，今夜不刀人（{_counts_text(counts)}）"),
         )
+        _emit_witch_kill_target(state, emit)
         return Phase.NIGHT_SEER
 
     if len(tops) == 1:
@@ -208,6 +232,7 @@ def _resolve_wolf_vote(state: GameState, emit: EmitFn, runoff: bool) -> Phase:
                 text=f"狼人决定刀 {tops[0]} 号（{_counts_text(counts)}）",
             ),
         )
+        _emit_witch_kill_target(state, emit)
         return Phase.NIGHT_SEER
 
     emit(
@@ -239,6 +264,7 @@ def _resolve_wolf_vote(state: GameState, emit: EmitFn, runoff: bool) -> Phase:
             },
             render=RenderText(text=text),
         )
+        _emit_witch_kill_target(state, emit)
         return Phase.NIGHT_SEER
 
     state.tie_candidates = tops
