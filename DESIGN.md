@@ -646,15 +646,15 @@ defaults:
 
 | 阶段 | 动作工具 |
 | --- | --- |
-| 夜间·狼人协商 | 无（直接发言，正文即 `speak`） |
+| 夜间·狼人协商 | 无（直接发言，正文即发言动作） |
 | 夜间·狼人出刀 | `wolf_vote_kill(seat)` / `abstain()` |
 | 夜间·预言家 | `seer_check(seat)` |
 | 夜间·女巫 | `witch_save()` / `witch_poison(seat)` / `witch_pass()` |
 | 猎人触发 | `hunter_shoot(seat)` / `hunter_hold()` |
-| 白天·讨论 | 无（直接发言，正文即 `speak`） |
+| 白天·讨论 | 无（直接发言，正文即发言动作） |
 | 白天·投票 | `vote(seat)` / `abstain()` |
-| 遗言 | 无（直接发言，正文即 `last_words`） |
-| 赛后感想 | 无（直接发言，正文即 `reflect`） |
+| 遗言 | 无（直接发言，正文即遗言动作） |
+| 赛后感想 | 无（直接发言，正文即感想动作） |
 
 **关于 `speak` / `last_words` / `reflect`（v0.26 起不再是工具）**：这三类动作的表意
 完全等同于「模型说了一段话」，再要求它额外调一个 `speak(message)` 工具纯属多此一举，
