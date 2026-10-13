@@ -1,0 +1,26 @@
+# 对局参数样例 —— 复制到 configs/game.yaml 后修改（真实配置不入库）
+#
+#   cp configs/game.example.yaml configs/game.yaml
+
+game:
+  # 可选。留空则每次随机。填了只能锁定规则侧（发牌、兜底选择），
+  # LLM 输出本身不确定，因此不承诺整局可复现。
+  seed: null
+
+agent:
+  max_tool_turns: 4                 # 一次决策最多几轮工具循环，超出走兜底
+  max_concurrency: 4                # 全局并发信号量（同时投票最坏 9 席一起打 API）
+  memory:
+    enabled: true                   # 是否暴露 memory_write / memory_read
+    max_entries: 20                 # 单个玩家的记忆条目上限
+    max_chars_per_entry: 200        # 单条记忆字数上限
+
+context:
+  max_public_events: 60             # 公开历史保留条数，超出做模板摘要压缩
+
+persist:
+  root: data                        # 存档根目录，实际写在 data/games/{game_id}/
+  dump_agent_contexts: true         # 是否落盘每个席位的完整消息历史快照
+
+thinking:
+  require_think_tool: false         # 对总是把 content 留空的模型，改为强制先调 think() 工具

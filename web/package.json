@@ -1,0 +1,29 @@
+{
+  "name": "werewolf-arena-web",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "gen:types": "cd .. && uv run python -m scripts.gen_ts_types",
+    "check:types": "cd .. && uv run python -m scripts.gen_ts_types --check"
+  },
+  "dependencies": {
+    "@rollup/rollup-win32-x64-msvc": "^4.64.1",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "zustand": "^5.0.2"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.6.3",
+    "vite": "^6.0.5"
+  }
+}

@@ -14,8 +14,8 @@ dist/
 downloads/
 eggs/
 .eggs/
-lib/
-lib64/
+/lib/
+/lib64/
 parts/
 sdist/
 var/
@@ -218,3 +218,20 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Real configs — only *.example.yaml samples are committed
+configs/*.yaml
+configs/*.yml
+!configs/*.example.yaml
+!configs/*.example.yml
+
+# Node / frontend
+node_modules/
+web/dist/
+web/.vite/
+
+# Project runtime artifacts (game records, index, logs)
+data/
+
+# WorkBuddy agent memory (local work logs, not part of the project source)
+.workbuddy/

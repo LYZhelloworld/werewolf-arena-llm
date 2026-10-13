@@ -1,0 +1,386 @@
+"""多轮工具循环（ReAct）。
+
+规则见 DESIGN.md §7.2：
+
+1. 辅助工具（记忆 / 思考）执行完继续循环，不推进阶段。
+2. 动作工具参数非法 → 把**具体原因**作为 tool result 回给模型重选（不是直接报错）。
+3. 轮数用尽仍无合法动作 → 交给编排层兜底，并打 ``fallback`` 标记。
+4. 不使用 ``tool_choice="required"``——必须先允许模型调辅助工具。
+5. 发言类阶段（发言 / 遗言 / 感想）**不再有 speak 工具**：模型直接把要说的话写进
+   回复正文即视为该动作，由本循环把纯文本转成对应 Action 立即返回。这省掉了「先说话、
+   再被催着调 speak 工具」的空转（实测会堆出 4 次空转然后走兜底）。动作类阶段仍沿用
+   第 4 点：只说话没调工具 → 写进历史 + 点名工具要它动手。
+
+回传被 provider 拒绝（400）时的降级也在这里（§7.4.3）。
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+from agents.client import ChatRequest, LLMClient, LLMError, LLMResponse
+from agents.context import AgentContext
+from agents.thinking import capture
+from agents.tools import (
+    MEMORY_READ,
+    MEMORY_WRITE,
+    MESSAGE_TYPES,
+    build_tools,
+    call_to_action,
+    is_memory_tool,
+    is_think_tool,
+)
+from engine.actions import Action, ActionType, LegalAction
+from engine.events import Event, RenderText, Thinking, Visibility
+from engine.state import GameState
+
+# 回传被拒时要从历史消息里剥掉的字段（auto 探测的候选 + 已确定的字段名）
+_STRIP_FIELDS = ("reasoning_content", "reasoning", "reasoning_text")
+
+# 模型「只说话不动手」时的纠正提示。**必须点名本回合实际可用的工具**：
+# 泛泛的「请调用一个工具」对弱模型没用，实测会一路说话到轮数用尽。
+_TOOL_REMINDER = (
+    "你只发言、没有调用工具，这一步还没有生效。请立刻调用一个工具行动，本回合可选：{tools}。"
+)
+
+# 发言类阶段没有动作工具，模型直接说的话就是发言；收到空回复时用这条提醒它开口。
+_SPEAK_REMINDER = "请直接发言，你写下的内容就是本回合的发言，不需要调用任何工具。"
+
+
+class PendingEvent(BaseModel):
+    """待编号的事件原型。
+
+    记忆读写这类事件由 agent 产出，但 ``seq`` 只有引擎知道，
+    所以这里只给内容与可见性，编号交给编排层（DESIGN.md §5.3.1）。
+    """
+
+    type: str
+    visibility: Visibility
+    actor: int | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    # 展示文本。**每个事件都必须带上**——前端与回放 UI 只认这一份，
+    # 缺了就只能把 raw payload 当 JSON 摊给用户看（真实踩过）。
+    render: RenderText | None = None
+
+
+@dataclass
+class TurnOutcome:
+    """一回合的结果。``action`` 为 None 表示要兜底。"""
+
+    action: Action | None
+    thinking: Thinking
+    tool_turns: int = 0
+    fallback: bool = False
+    latency_ms: int = 0
+    prompt_tokens: int | None = None
+    completion_tokens: int | None = None
+    network_retries: int = 0
+    pending_events: list[PendingEvent] = field(default_factory=list)
+    rejections: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class TurnParams:
+    """一次请求里不变的参数。"""
+
+    model: str
+    temperature: float = 0.8
+    max_tokens: int = 1024
+    extra_body: dict[str, Any] = field(default_factory=dict)
+    max_tool_turns: int = 4
+    require_think_tool: bool = False
+
+
+async def run_turn(
+    client: LLMClient,
+    context: AgentContext,
+    state: GameState,
+    legal: list[LegalAction],
+    params: TurnParams,
+) -> TurnOutcome:
+    """跑完一个席位的完整回合（可能多轮）。"""
+    tools = build_tools(
+        legal,
+        memory_enabled=context.memory.enabled,
+        require_think_tool=params.require_think_tool,
+    )
+    # 本回合若是发言类阶段（发言 / 遗言 / 感想），模型直接说的话就是动作本身。
+    message_action = _message_action_type(legal)
+    targets = sorted({seat for spec in legal for seat in spec.allowed_targets})
+    context.begin_turn(state, targets)
+
+    thinking = Thinking(text=None, source="none", replayed=False)
+    outcome = TurnOutcome(action=None, thinking=thinking)
+
+    for turn in range(params.max_tool_turns):
+        # replay 一旦被降级就不再尝试剥离重试（没什么可剥的了）
+        response = await _request(client, context, tools, params, outcome)
+        if response is None:  # 回传被拒且策略是 fail，或重试也失败
+            outcome.fallback = True
+            return outcome
+
+        _merge_thinking(outcome.thinking, capture(response.raw, context.thinking), context)
+        outcome.tool_turns = turn + 1
+        outcome.latency_ms += response.latency_ms
+        outcome.network_retries += response.network_retries
+        outcome.prompt_tokens = (outcome.prompt_tokens or 0) + (response.prompt_tokens or 0)
+        outcome.completion_tokens = (outcome.completion_tokens or 0) + (
+            response.completion_tokens or 0
+        )
+
+        if not response.tool_calls:
+            text = (response.content or "").strip()
+            if message_action is not None and text:
+                # 发言类阶段：模型直接说的话就是发言动作，不再要求调工具。
+                # 既省掉「说话→被催工具」的空转，也从根上消除「没调 speak」类兜底。
+                context.append_assistant(text, capture(response.raw, context.thinking), [])
+                outcome.action = Action(actor=context.seat, type=message_action, message=text)
+                return outcome
+            if message_action is not None:
+                # 空回复：提醒它直接发言（本阶段本就无动作工具可点名）。
+                _nudge_speak(context)
+            else:
+                # 动作类阶段：先把这段发言写进历史，再点名工具要它动手。
+                # 不写发言的话，历史会退化成连续多条 user 消息（实测一局堆出 8 条），
+                # 而且模型看不到自己刚说过什么，只会把同一段话原样再说一遍。
+                _record_spoken_reply(context, response)
+                _ask_for_tool(context, tools)
+            continue
+
+        context.append_assistant(
+            response.content,
+            capture(response.raw, context.thinking),
+            [_as_tool_call_payload(call) for call in response.tool_calls],
+        )
+
+        results: list[tuple[str, str, str]] = []  # (call_id, name, content)
+        for call in response.tool_calls:
+            name = call.name
+            if name == MEMORY_WRITE:
+                ok, text = context.write_memory(
+                    str(call.arguments.get("key", "")), str(call.arguments.get("content", ""))
+                )
+                if ok:
+                    key = call.arguments.get("key")
+                    content = call.arguments.get("content")
+                    outcome.pending_events.append(
+                        PendingEvent(
+                            type="memory_write",
+                            visibility=Visibility.SELF,
+                            actor=context.seat,
+                            payload={"key": key, "content": content},
+                            render=RenderText(
+                                text=f"{context.seat} 号 记下「{key}」：{content}",
+                            ),
+                        )
+                    )
+                results.append((call.id, name, text))
+                continue
+
+            if name == MEMORY_READ:
+                keys = list(context.memories)
+                recalled = "、".join(keys) if keys else "（暂无记忆）"
+                outcome.pending_events.append(
+                    PendingEvent(
+                        type="memory_read",
+                        visibility=Visibility.SELF,
+                        actor=context.seat,
+                        payload={"keys": keys},
+                        render=RenderText(text=f"{context.seat} 号 回忆：{recalled}"),
+                    )
+                )
+                results.append((call.id, name, context.read_memory()))
+                continue
+
+            if is_think_tool(name):
+                text = str(call.arguments.get("text", "")).strip()
+                if text:
+                    _merge_thinking(
+                        outcome.thinking, Thinking(text=text, source="think_tool"), context
+                    )
+                results.append((call.id, name, "已记录你的思考。"))
+                continue
+
+            if is_memory_tool(name):  # pragma: no cover - 上面已覆盖两个记忆工具
+                results.append((call.id, name, "未知的记忆工具。"))
+                continue
+
+            action, reason = call_to_action(call, legal)
+            if action is not None:
+                results.append((call.id, name, "已执行。"))
+                for call_id, tool_name, content in results:
+                    context.append_tool_result(call_id, tool_name, content)
+                outcome.action = action
+                return outcome
+
+            # 非法：把原因回给模型让它下一轮重选，同时留痕给观众（DESIGN §8.3）
+            detail = reason or "非法动作"
+            outcome.rejections.append(detail)
+            outcome.pending_events.append(
+                PendingEvent(
+                    type="action_rejected",
+                    visibility=Visibility.SPECTATOR,
+                    actor=context.seat,
+                    payload={"tool": name, "reason": detail},
+                    render=RenderText(
+                        text=f"{context.seat} 号 动作被拒（{name}）：{detail}",
+                    ),
+                )
+            )
+            results.append((call.id, name, detail))
+
+        for call_id, tool_name, content in results:
+            context.append_tool_result(call_id, tool_name, content)
+
+    outcome.fallback = True
+    return outcome
+
+
+# ---------------------------------------------------------------------------
+# 内部实现
+# ---------------------------------------------------------------------------
+
+
+async def _request(
+    client: LLMClient,
+    context: AgentContext,
+    tools: list[dict[str, Any]],
+    params: TurnParams,
+    outcome: TurnOutcome,
+) -> LLMResponse | None:
+    """发一次请求。回传被拒时按 ``replay_on_error`` 剥离重试一次。"""
+    request = ChatRequest(
+        model=params.model,
+        messages=context.messages,
+        tools=tools,
+        temperature=params.temperature,
+        max_tokens=params.max_tokens,
+        extra_body=params.extra_body,
+    )
+    try:
+        return await client.achat(request)
+    except LLMError as exc:
+        if not _looks_like_replay_rejection(exc):
+            raise
+        if context.thinking.replay_on_error == "fail":
+            outcome.rejections.append(f"LLM 调用失败：{exc.message}")
+            return None
+        if not context.thinking.replay:
+            outcome.rejections.append(f"LLM 调用失败：{exc.message}")
+            return None
+        # 剥离历史里的 CoT 重试一次，并把本 agent 的 replay 降级（§7.4.3）
+        _strip_reasoning(context.messages)
+        context.thinking.replay = False
+        detail = f"回传思考内容被拒绝，已剥离重试：{exc.message}"
+        outcome.rejections.append(detail)
+        outcome.pending_events.append(
+            PendingEvent(
+                type="llm_downgrade",
+                visibility=Visibility.SPECTATOR,
+                actor=context.seat,
+                payload={"reason": detail, "status_code": exc.status_code},
+                render=RenderText(
+                    text=f"{context.seat} 号 CoT 回传被拒，已降级：{detail}",
+                ),
+            )
+        )
+        return await client.achat(request)
+
+
+def _looks_like_replay_rejection(exc: LLMError) -> bool:
+    """回传被拒通常是 400 且错误信息里提到推理字段。"""
+    if exc.status_code not in (None, 400):
+        return False
+    text = f"{exc.message} {exc}".lower()
+    return any(token in text for token in ("reasoning", "thinking"))
+
+
+def _strip_reasoning(messages: list[dict[str, Any]]) -> None:
+    for message in messages:
+        for name in _STRIP_FIELDS:
+            message.pop(name, None)
+
+
+def _as_tool_call_payload(call: Any) -> dict[str, Any]:
+    return {
+        "id": call.id,
+        "type": "function",
+        "function": {
+            "name": call.name,
+            "arguments": json.dumps(call.arguments, ensure_ascii=False),
+        },
+    }
+
+
+def _message_action_type(legal: list[LegalAction]) -> ActionType | None:
+    """本席位本回合若是发言类阶段，返回对应的动作类型（发言 / 遗言 / 感想）。
+
+    发言类阶段的工具已被移除（见 :func:`agents.tools.action_tools`），模型直接
+    输出的正文就是该动作；这里只负责判断「本回合到底是不是这类阶段」。
+    """
+    for spec in legal:
+        if spec.type in MESSAGE_TYPES:
+            return spec.type
+    return None
+
+
+def _record_spoken_reply(context: AgentContext, response: LLMResponse) -> None:
+    """把「只说话没动手」的那次回复也留在历史里。
+
+    正文为空时不写——``{"role": "assistant"}`` 这种空消息会被部分服务端直接拒掉。
+    """
+    text = (response.content or "").strip()
+    if not text:
+        return
+    context.append_assistant(text, capture(response.raw, context.thinking), [])
+
+
+def _nudge_speak(context: AgentContext) -> None:
+    """发言类阶段收到空回复时，提醒模型直接发言（本阶段没有动作工具可点名）。"""
+    reminder = _SPEAK_REMINDER
+    if context.messages and context.messages[-1].get("content") == reminder:
+        return
+    context.messages.append({"role": "user", "content": reminder})
+
+
+def _ask_for_tool(context: AgentContext, tools: list[dict[str, Any]]) -> None:
+    """点名本回合可用的工具，要求模型动手；同一条提示不重复堆叠。"""
+    names = "、".join(
+        spec["function"]["name"] for spec in tools if spec.get("function", {}).get("name")
+    )
+    reminder = _TOOL_REMINDER.format(tools=names or "（无）")
+    if context.messages and context.messages[-1].get("content") == reminder:
+        return
+    context.messages.append({"role": "user", "content": reminder})
+
+
+def _merge_thinking(target: Thinking, incoming: Thinking, context: AgentContext) -> None:
+    """多轮时把各轮的 CoT 串起来，source 取第一个有意义的。"""
+    if not incoming.text:
+        return
+    if target.text:
+        target.text = f"{target.text}\n\n{incoming.text}"
+    else:
+        target.text = incoming.text
+        target.source = incoming.source
+    if context.thinking.replay:
+        target.replayed = True
+
+
+def build_event(outcome: PendingEvent, state: GameState, seq: int, game_id: str) -> Event:
+    """给待编号事件补上 seq / game_id / day / phase。"""
+    return Event(
+        seq=seq,
+        game_id=game_id,
+        day=state.day,
+        phase=state.phase.value,
+        type=outcome.type,
+        visibility=outcome.visibility,
+        actor=outcome.actor,
+        payload=outcome.payload,
+        render=outcome.render,
+    )
